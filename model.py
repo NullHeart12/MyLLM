@@ -1,4 +1,11 @@
+from ast import arg
+import select
+from tkinter import NO
+from turtle import forward
+
+from regex import F
 import torch
+from torch import nn
 
 from transformers import PretrainedConfig
 
@@ -35,7 +42,7 @@ class MyModelConfig(PretrainedConfig):
         super().__init__(**kwargs)
         
         
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -137,6 +144,48 @@ def repeat_kv(x:torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, seq_len, n_kv_heads * n_rep, head_dim)
     )
     
+class Attention(nn.Module):
+    def __init__(self, args: MyModelConfig):
+        self.dim = args.dim
+        self.head_dim = self.dim // self.n_heads    
+        self.n_heads = args.n_heads
+        if args.n_kv_heads is None:
+            self.n_kv_heads = args.n_heads
+        else:
+            self.n_kv_heads = args.n_kv_heads
+        assert self.n_heads % self.n_kv_heads == 0
+        
+        self.model_parallel_size = 1
+        self.n_local_heads = self.n_heads // self.model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // self.model_parallel_size
+        
+        self.Wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.Wk = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.Wv = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.Wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+        
+        
+        
+    def forward(self, 
+                X: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+                attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        bs, seq_len, _ = X.shape
+        
+        Xq, Xk, Xv = self.Wq(X), self.Wk(X), self.Wv(X)
+        
+        Xq = Xq.view(bs, seq_len, self.n_local_heads, self.head_dim)
+        Xk = Xk.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
+        Xv = Xv.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
+        
+        Xq, Xk = apply_rotary_positional_embedding(Xq, Xk, freqs_cos, freqs_sin)
+        
+        
+        
+        pass
+        
 
     
     
