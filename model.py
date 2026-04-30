@@ -1,11 +1,10 @@
 from ast import arg
-import select
-from tkinter import NO
-from turtle import forward
+from math import sqrt
+from typing import Optional
 
-from regex import F
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from transformers import PretrainedConfig
 
@@ -146,32 +145,51 @@ def repeat_kv(x:torch.Tensor, n_rep: int) -> torch.Tensor:
     
 class Attention(nn.Module):
     def __init__(self, args: MyModelConfig):
+        super().__init__()
         self.dim = args.dim
-        self.head_dim = self.dim // self.n_heads    
         self.n_heads = args.n_heads
+        self.head_dim = self.dim // self.n_heads           
         if args.n_kv_heads is None:
             self.n_kv_heads = args.n_heads
         else:
             self.n_kv_heads = args.n_kv_heads
         assert self.n_heads % self.n_kv_heads == 0
+        self.n_reps = self.n_heads // self.n_kv_heads
+        self.dropout = args.dropout
         
+        """这里的代码是用来设置模型并行的相关参数的。但是在该处为无效设置，
+        因为需要使用fairscale或者torch.distributed来实现模型并行，并且需要在训练脚本中进行相应的设置和调用。
+        后续计划添加相关设置"""      
         self.model_parallel_size = 1
         self.n_local_heads = self.n_heads // self.model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // self.model_parallel_size
         
         self.Wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
-        self.Wk = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
-        self.Wv = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.Wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.Wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.Wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
         
+        self.attn_dropout = nn.Dropout(self.dropout)
+        self.resi_dropout = nn.Dropout(self.dropout)
         
+        self.flash = hasattr(F, "scaled_dot_product_attention")        
         
     def forward(self, 
                 X: torch.Tensor,
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
-                attention_mask: torch.Tensor
+                key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """
+        这个函数是用来执行注意力机制的前向传播的。
+        参数：
+        X: 输入张量，形状为（batch_size, seq_len, dim）。
+        freqs_cos: 位置编码的余弦频率矩阵，形状为（seq_len, head_dim）。
+        freqs_sin: 位置编码的正弦频率矩阵，形状为（seq_len, head_dim）。
+        key_padding_mask: 可选的键填充掩码，形状为（batch_size, seq_len）。是为了在多批次训练时对齐每个序列的长度。
+        输出：
+        output: 注意力机制的输出张量，形状为（batch_size, seq_len, dim）。
+        """  
         bs, seq_len, _ = X.shape
         
         Xq, Xk, Xv = self.Wq(X), self.Wk(X), self.Wv(X)
@@ -182,10 +200,50 @@ class Attention(nn.Module):
         
         Xq, Xk = apply_rotary_positional_embedding(Xq, Xk, freqs_cos, freqs_sin)
         
+        Xk = repeat_kv(Xk, self.n_reps)
+        Xv = repeat_kv(Xv, self.n_reps)
         
+        Xq = Xq.transpose(1, 2)
+        Xk = Xk.transpose(1, 2)
+        Xv = Xv.transpose(1, 2)
         
-        pass
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask[:, None, None, :].to(dtype=torch.bool)
         
+        if self.flash:
+            if key_padding_mask is not None:
+                casual_mask = torch.full((1, 1, seq_len, seq_len), 1, dtype=torch.bool, device=key_padding_mask.device).tril()
+                attn_mask = key_padding_mask & casual_mask
+                attention = F.scaled_dot_product_attention(
+                    Xq,
+                    Xk,
+                    Xv,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=False,
+                )
+            else:
+                attention = F.scaled_dot_product_attention(
+                    Xq,
+                    Xk,
+                    Xv,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=True
+                )
+        else:
+            scores = torch.matmul(Xq, Xk.transpose(2, 3)) / sqrt(self.head_dim)
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(~key_padding_mask, float('-inf'))
+            casual_mask = torch.full((1, 1, seq_len, seq_len), float('-inf'), device=Xq.device).triu(diagonal=1)
+            scores = scores + casual_mask
+            scores = torch.softmax(scores, dim=-1)
+            attention = self.attn_dropout(scores).matmul(Xv)
+        
+        attention = attention.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+        
+        output = self.resi_dropout(attention)
+        output = self.Wo(output)
+        return output
 
     
     
@@ -212,3 +270,17 @@ if __name__ == "__main__":
     # print(Xk_out.shape)
     # print(Xq_out)
     # print(Xk_out)
+    
+    """这个代码块是用来测试Attention类的功能的。"""
+    args = MyModelConfig()
+    attention_model = Attention(args)
+    
+    bs = 1
+    seq_len = 50
+    X = torch.randn(bs, seq_len, args.dim)
+    
+    freqs_cos, freqs_sin = precompute_freqs_cs(seq_len, args.dim // args.n_heads)
+    
+    output = attention_model(X, freqs_cos, freqs_sin)
+    
+    print("output shape", output.shape)
