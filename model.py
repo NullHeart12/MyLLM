@@ -1,4 +1,3 @@
-from ast import arg
 from math import sqrt
 from typing import Optional
 
@@ -7,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from transformers import PretrainedConfig
+from urllib3 import Retry
 
 class MyModelConfig(PretrainedConfig):
     model_type = "my_model"
@@ -75,9 +75,9 @@ def precompute_freqs_cs(seq_len: int, dim: int, theta: float = 10000.0):
     freqs_sin: 位置编码的正弦频率矩阵。形状为（seq_len, dim）。
     """
     
-    freqs = 1.0 / theta ** (2 * (torch.arange(dim) // 2) / dim)
+    freqs = 1.0 / theta ** (2 * (torch.arange(dim) // 2).float() / dim)
     idx = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(idx, freqs)
+    freqs = torch.outer(idx, freqs).float()
     freqs_cos = torch.cos(freqs)
     freqs_sin = torch.sin(freqs)
     return freqs_cos, freqs_sin
@@ -107,6 +107,7 @@ def apply_rotary_positional_embedding(Xq:torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     这个函数是用来将旋转位置编码应用于查询张量Xq和键张量Xk的。
+    RoPE最好在FP32精度下计算，因为它涉及到正弦和余弦函数的计算，这些函数在低精度下可能会导致数值不稳定。
     参数：
     Xq: 查询张量，形状为（batch_size, seq_len, n_heads, head_dim）。
     Xk: 键张量，形状为（batch_size, seq_len, n_heads, head_dim）。
@@ -117,7 +118,11 @@ def apply_rotary_positional_embedding(Xq:torch.Tensor,
     Xq_out: 应用旋转位置编码后的查询张量，形状为（batch_size, seq_len, n_heads, head_dim）。
     Xk_out: 应用旋转位置编码后的键张量，形状为（batch_size, seq_len, n_heads, head_dim）。
     """
-       
+    original_dtype = Xq.dtype
+    
+    Xq = Xq.float()
+    Xk = Xk.float()
+    
     q_pair = Xq.reshape(*Xq.shape[:-1], -1, 2)
     q_trans = torch.stack([-q_pair[..., 1], q_pair[..., 0]], dim=-1)
     Xq_trans = q_trans.reshape(*Xq.shape)
@@ -130,9 +135,9 @@ def apply_rotary_positional_embedding(Xq:torch.Tensor,
     
     Xq_out = Xq * freqs_cos + Xq_trans * freqs_sin
     Xk_out = Xk * freqs_cos + Xk_trans * freqs_sin
-    return Xq_out, Xk_out 
-    
-    
+    return Xq_out.type_as(original_dtype), Xk_out.type_as(original_dtype)
+
+
 def repeat_kv(x:torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
@@ -236,7 +241,7 @@ class Attention(nn.Module):
                 scores = scores.masked_fill(~key_padding_mask, float('-inf'))
             casual_mask = torch.full((1, 1, seq_len, seq_len), float('-inf'), device=Xq.device).triu(diagonal=1)
             scores = scores + casual_mask
-            scores = torch.softmax(scores, dim=-1)
+            scores = torch.softmax(scores.float(), dim=-1).type_as(scores)
             attention = self.attn_dropout(scores).matmul(Xv)
         
         attention = attention.transpose(1, 2).contiguous().view(bs, seq_len, -1)
@@ -245,6 +250,53 @@ class Attention(nn.Module):
         output = self.Wo(output)
         return output
 
+
+class FeedForward(nn.Module):
+    """
+    这个类是用来实现Transformer中的前馈神经网络（Feed-Forward Network）的。
+    这里的forward有三个线性层，分别是up、gate和down。up和gate层将输入张量X映射到hidden_dim维度的空间中，而down层将hidden_dim维度的张量映射回dim维度的空间中。
+    在前馈神经网络中，通常会使用一个激活函数来增加模型的非线性能力。在这个实现中，使用了SiLU（Sigmoid Linear Unit）作为激活函数。
+    """
+    def __init__(self, dim:int, hidden_dim:int, mutiple_of:int, dropout:float):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = dim * 4
+            hidden_dim = 2 * hidden_dim // 3
+            hidden_dim = mutiple_of * ((hidden_dim + mutiple_of - 1) // mutiple_of) 
+
+        self.up = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, X:torch.Tensor):
+        return self.dropout(self.down(F.silu(self.gate(X)) * self.up(X)))
+        
+class TransformerBlock(nn.Module):
+    """
+    这个类是用来实现Transformer中的一个块（Transformer Block）的。
+    一个Transformer块通常包含一个多头自注意力机制和一个前馈神经网络。在这个实现中，Transformer块包含一个RMSNorm层、一个Attention层、另一个RMSNorm层和一个FeedForward层。
+    这里在attention和FFN之间使用了残差连接（residual connection），即将输入张量X与注意力机制的输出相加，得到h，然后将h与前馈神经网络的输出相加，得到最终的输出。
+    """
+    def __init__(self, block_num:int, args:MyModelConfig):
+        super().__init__()     
+        self.block_num = block_num
+        
+        self.attn_RMSNorm = RMSNorm(args.dim, args.norm_eps)
+        self.attention = Attention(args)
+        self.FFN_RMSNorm = RMSNorm(args.dim, args.norm_eps)
+        self.FFN = FeedForward(args.dim, args.hidden_dim, args.multiple_of, args.dropout)
+    
+    def forward(self, 
+                X:torch.Tensor, 
+                freqs_cos:torch.Tensor, 
+                freqs_sin:torch.Tensor, 
+                key_padding_mask:torch.Tensor
+        ):
+        h = X + self.attention(self.attn_RMSNorm(X), freqs_cos, freqs_sin, key_padding_mask)
+        output = h + self.FFN(self.FFN_RMSNorm(h))
+        return output
+    
     
     
 if __name__ == "__main__":
@@ -272,15 +324,24 @@ if __name__ == "__main__":
     # print(Xk_out)
     
     """这个代码块是用来测试Attention类的功能的。"""
-    args = MyModelConfig()
-    attention_model = Attention(args)
+    # args = MyModelConfig()
+    # attention_model = Attention(args)
     
-    bs = 1
-    seq_len = 50
-    X = torch.randn(bs, seq_len, args.dim)
+    # bs = 1
+    # seq_len = 50
+    # X = torch.randn(bs, seq_len, args.dim)
     
-    freqs_cos, freqs_sin = precompute_freqs_cs(seq_len, args.dim // args.n_heads)
+    # freqs_cos, freqs_sin = precompute_freqs_cs(seq_len, args.dim // args.n_heads)
     
-    output = attention_model(X, freqs_cos, freqs_sin)
+    # output = attention_model(X, freqs_cos, freqs_sin)
     
-    print("output shape", output.shape)
+    # print("output shape", output.shape)
+    
+    """这个代码块是用来测试FeedForward类的功能的。"""
+    # args = MyModelConfig()
+    # feedforward_model = FeedForward(args.dim, args.hidden_dim, args.multiple_of, args.dropout)
+    # bs = 1
+    # seq_len = 50
+    # X = torch.randn(bs, seq_len, args.dim)
+    # output = feedforward_model(X)
+    # print("output shape", output.shape)
