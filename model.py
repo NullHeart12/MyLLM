@@ -1,12 +1,14 @@
 from math import sqrt
+from turtle import forward
 from typing import Optional
 
 import torch
-from torch import nn
+from torch import embedding, nn
+from torch.jit import ignore
 from torch.nn import functional as F
 
 from transformers import PretrainedConfig
-from urllib3 import Retry
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MyModelConfig(PretrainedConfig):
     model_type = "my_model"
@@ -257,12 +259,12 @@ class FeedForward(nn.Module):
     这里的forward有三个线性层，分别是up、gate和down。up和gate层将输入张量X映射到hidden_dim维度的空间中，而down层将hidden_dim维度的张量映射回dim维度的空间中。
     在前馈神经网络中，通常会使用一个激活函数来增加模型的非线性能力。在这个实现中，使用了SiLU（Sigmoid Linear Unit）作为激活函数。
     """
-    def __init__(self, dim:int, hidden_dim:int, mutiple_of:int, dropout:float):
+    def __init__(self, dim:int, hidden_dim:int, multiple_of:int, dropout:float):
         super().__init__()
         if hidden_dim is None:
             hidden_dim = dim * 4
             hidden_dim = 2 * hidden_dim // 3
-            hidden_dim = mutiple_of * ((hidden_dim + mutiple_of - 1) // mutiple_of) 
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of) 
 
         self.up = nn.Linear(dim, hidden_dim, bias=False)
         self.gate = nn.Linear(dim, hidden_dim, bias=False)
@@ -291,13 +293,127 @@ class TransformerBlock(nn.Module):
                 X:torch.Tensor, 
                 freqs_cos:torch.Tensor, 
                 freqs_sin:torch.Tensor, 
-                key_padding_mask:torch.Tensor
+                key_padding_mask:Optional[torch.Tensor]=None
         ):
         h = X + self.attention(self.attn_RMSNorm(X), freqs_cos, freqs_sin, key_padding_mask)
         output = h + self.FFN(self.FFN_RMSNorm(h))
         return output
     
     
+class Transformer(nn.Module):
+    config_class = MyModelConfig
+    
+    def __init__(self, args:MyModelConfig):
+        super().__init__()
+        
+        self.args = args
+        self.vocab_size = args.vocab_size
+        self.dim = args.dim
+        
+        self.token_embeddings = nn.Embedding(self.vocab_size, self.dim)
+        
+        self.dropout = nn.Dropout(args.dropout)
+        
+        self.n_layers = args.n_layers
+        self.layers = nn.ModuleList()
+        for id in range(self.n_layers):
+            cur_layer = TransformerBlock(id, args)
+            self.layers.append(cur_layer)
+            
+        self.norm_eps = args.norm_eps
+        self.RMSNorm = RMSNorm(self.dim, self.norm_eps)
+        
+        self.output = nn.Linear(self.dim, self.vocab_size, bias=False)    
+        
+        self.token_embeddings.weight = self.output.weight
+        
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith("Wo.weight") or pn.endswith("down.weight"):
+                torch.nn.init.normal_(p, mean=0, std=0.02 / sqrt(2 * self.n_layers))
+        
+        self.max_seq_len = args.max_seq_len
+        self.freqs_cos, self.freqs_sin = precompute_freqs_cs(self.max_seq_len, self.dim)
+        
+    def _init_weights(self, module:nn.Module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
+            torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
+            
+    def _prepare_padding_mask(self,
+                              key_padding_mask:Optional[torch.Tensor],
+                              tokens:Optional[torch.Tensor] 
+        ) -> Optional[torch.Tensor]:
+        if key_padding_mask is None:
+            return None
+        if key_padding_mask.dim() == 4:
+            key_padding_mask = key_padding_mask[:, 0, 0, :]
+        elif key_padding_mask.dim() == 3:
+            key_padding_mask = key_padding_mask[:, 0, :]
+        key_padding_mask = key_padding_mask.to(tokens.device)
+        if key_padding_mask.dtype != torch.bool:
+            key_padding_mask = key_padding_mask > 0
+        assert key_padding_mask.shape == tokens.shape
+        return key_padding_mask
+    
+    def _left_pad_by_padding_mask(self,
+                                  tokens:torch.Tensor,
+                                  key_padding_mask:Optional[torch.Tensor],
+                                  pad_id:int
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if key_padding_mask is None or key_padding_mask.all():
+            return tokens, key_padding_mask
+
+        bsz = tokens.shape[0]
+        lengths = key_padding_mask.sum(dim=1)
+        max_len = lengths.max().item()
+        
+        new_tokens = tokens.new_full((bsz, max_len), pad_id)
+        new_padding_mask = key_padding_mask.new_zeros((bsz, max_len), dtype=torch.bool)
+        
+        for i in range(bsz):
+            cur_len = lengths[i].item()
+            new_tokens[i, -cur_len:] = tokens[i][key_padding_mask[i]]
+            new_padding_mask[i, -cur_len:] = True
+            
+        return new_tokens, new_padding_mask
+    
+    
+    def forward(self,
+                input_ids:torch.Tensor,
+                labels:Optional[torch.Tensor] = None,
+                key_padding_mask:Optional[torch.Tensor] = None,
+                **kwargs
+    ) -> CausalLMOutputWithPast:                
+        x = self.token_embeddings(input_ids)
+        x = self.dropout(x)
+        
+        for layer in self.n_layers:
+            x = layer(x, self.freqs_cos, self.freqs_sin, key_padding_mask)
+            
+        x = self.RMSNorm(x)
+        
+        if labels is not None:
+            logits = self.output(x)
+            ignore_index = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+            if torch.any(labels == -100):
+                ignore_index = -100
+            loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
+                ignore_index=ignore_index,
+                reduction="none"
+            )
+        else:
+            logits = self.output(x[:, [-1], :])#采用left_padding
+            loss = None
+        
+        return CausalLMOutputWithPast(loss, logits)    
+        
+            
+        
     
 if __name__ == "__main__":
     
