@@ -1,10 +1,8 @@
 from math import sqrt
-from turtle import forward
 from typing import Optional
 
 import torch
-from torch import embedding, nn
-from torch.jit import ignore
+from torch import nn
 from torch.nn import functional as F
 
 from transformers import PretrainedConfig
@@ -137,7 +135,7 @@ def apply_rotary_positional_embedding(Xq:torch.Tensor,
     
     Xq_out = Xq * freqs_cos + Xq_trans * freqs_sin
     Xk_out = Xk * freqs_cos + Xk_trans * freqs_sin
-    return Xq_out.type_as(original_dtype), Xk_out.type_as(original_dtype)
+    return Xq_out.to(original_dtype), Xk_out.to(original_dtype)
 
 
 def repeat_kv(x:torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -280,10 +278,10 @@ class TransformerBlock(nn.Module):
     一个Transformer块通常包含一个多头自注意力机制和一个前馈神经网络。在这个实现中，Transformer块包含一个RMSNorm层、一个Attention层、另一个RMSNorm层和一个FeedForward层。
     这里在attention和FFN之间使用了残差连接（residual connection），即将输入张量X与注意力机制的输出相加，得到h，然后将h与前馈神经网络的输出相加，得到最终的输出。
     """
-    def __init__(self, block_num:int, args:MyModelConfig):
+    def __init__(self, block_id:int, args:MyModelConfig):
         super().__init__()     
-        self.block_num = block_num
-        
+        self.block_id = block_id
+
         self.attn_RMSNorm = RMSNorm(args.dim, args.norm_eps)
         self.attention = Attention(args)
         self.FFN_RMSNorm = RMSNorm(args.dim, args.norm_eps)
@@ -330,17 +328,20 @@ class Transformer(nn.Module):
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("Wo.weight") or pn.endswith("down.weight"):
-                torch.nn.init.normal_(p, mean=0, std=0.02 / sqrt(2 * self.n_layers))
+                nn.init.normal_(p, mean=0, std=0.02 / sqrt(2 * self.n_layers))
         
         self.max_seq_len = args.max_seq_len
-        self.freqs_cos, self.freqs_sin = precompute_freqs_cs(self.max_seq_len, self.dim)
+        freqs_cos, freqs_sin = precompute_freqs_cs(self.max_seq_len, self.dim // args.n_heads)
+        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin)
         
     def _init_weights(self, module:nn.Module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
-            torch.nn.init.zeros_(module.bias)
+            nn.init.normal_(module.weight, mean=0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
+            nn.init.normal_(module.weight, mean=0, std=0.02)
             
     def _prepare_padding_mask(self,
                               key_padding_mask:Optional[torch.Tensor],
@@ -363,6 +364,17 @@ class Transformer(nn.Module):
                                   key_padding_mask:Optional[torch.Tensor],
                                   pad_id:int
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        这个函数是用来根据填充掩码对输入的tokens进行左填充的。
+        参数：
+        tokens: 输入的token张量，形状为（batch_size, seq_len）。
+        key_padding_mask: 填充掩码，形状为（batch_size, seq_len）。其中True表示有效的token，False表示需要填充的位置。
+        pad_id: 用于填充的token ID。
+        输出：
+        new_tokens: 左填充后的token张量，形状为（batch_size, max_len）。其中max_len是根据key_padding_mask计算得到的最大有效长度。
+        new_padding_mask: 左填充后的填充掩码，形状为（batch_size, max_len）。其中True表示有效的token，False表示需要填充的位置。
+        """
+        
         if key_padding_mask is None or key_padding_mask.all():
             return tokens, key_padding_mask
 
@@ -385,13 +397,23 @@ class Transformer(nn.Module):
                 input_ids:torch.Tensor,
                 labels:Optional[torch.Tensor] = None,
                 key_padding_mask:Optional[torch.Tensor] = None,
-                **kwargs
-    ) -> CausalLMOutputWithPast:                
+    ) -> CausalLMOutputWithPast:     
+        """
+        这个函数是用来执行Transformer模型的前向传播的。
+        参数：
+        input_ids: 输入的token ID张量，形状为（batch_size, seq_len）。
+        labels: 可选的标签张量，形状为（batch_size, seq_len）。如果提供了labels，则会计算交叉熵损失。
+        key_padding_mask: 可选的填充掩码，形状为（batch_size, seq_len）。其中True表示有效的token，False表示需要填充的位置。
+        输出：  
+        CausalLMOutputWithPast: 包含损失和logits的输出对象。损失是一个标量张量，表示交叉熵损失；logits是一个张量，形状为（batch_size, seq_len, vocab_size），表示每个位置的预测分布。
+        """
+        
+        _, seq_len = input_ids.shape           
         x = self.token_embeddings(input_ids)
         x = self.dropout(x)
         
-        for layer in self.n_layers:
-            x = layer(x, self.freqs_cos, self.freqs_sin, key_padding_mask)
+        for layer in self.layers:
+            x = layer(x, self.freqs_cos[:seq_len, :], self.freqs_sin[:seq_len, :], key_padding_mask)
             
         x = self.RMSNorm(x)
         
@@ -412,6 +434,81 @@ class Transformer(nn.Module):
         
         return CausalLMOutputWithPast(loss, logits)    
         
+    @torch.inference_mode()
+    def generate(self,
+                 input_ids:torch.Tensor,
+                 max_new_tokens:int=256,
+                 top_k:int=None,
+                 temperature:float=1.0,
+                 key_padding_mask:Optional[torch.Tensor]=None,
+                 pad_id:int=None,
+                 eos_id:int=None
+    ):
+        """
+        这个函数是用来生成文本的。
+        参数：
+        input_ids: 输入的token ID张量，形状为（batch_size, seq_len）。
+        max_new_tokens: 要生成的新token的最大数量。
+        top_k: 用于top-k采样，表示保留的最高概率token的数量。
+        temperature: 用于调整生成文本的多样性，值越小越确定，值越大越随机。
+        key_padding_mask: 可选的填充掩码，形状为（batch_size, seq_len）。其中True表示有效的token，False表示需要填充的位置。
+        pad_id: 用于填充的token ID。
+        eos_id: 句子结束符的token ID。
+        输出：
+        output: 生成的token ID张量，形状为（batch_size, generated_seq_len）。其中generated_seq_len是根据max_new_tokens和输入序列长度计算得到的实际生成长度。
+        """
+        bs, _ = input_ids.shape
+        
+        if pad_id is None:
+            pad_id = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+        if eos_id is None:
+            eos_id = self.args.eos_token_id
+        
+        key_padding_mask = self._prepare_padding_mask(key_padding_mask, input_ids)
+        input_ids, key_padding_mask = \
+            self._left_pad_by_padding_mask(input_ids, key_padding_mask, pad_id)
+        
+        finished = torch.zeros(bs, 1, dtype=torch.bool, device=input_ids.device)
+        output = input_ids.new_empty((bs, 0))
+        
+        for i in range(max_new_tokens):
+            input_ids = input_ids if input_ids.shape[1] <= self.max_seq_len \
+                else input_ids[:, -self.max_seq_len:]
+            if key_padding_mask is not None:
+                key_padding_mask = key_padding_mask if key_padding_mask.shape[1] \
+                    <= self.max_seq_len else key_padding_mask[:, -self.max_seq_len:]
+            
+            logits = self(input_ids, key_padding_mask=key_padding_mask).logits[:, -1, :]
+            
+            if temperature == 0.0:
+                _, next_tokens = torch.topk(logits, k=1, dim=-1)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, k=min(top_k, logits.size(-1)), dim=-1)
+                    logits[logits < v[:, [-1]]] = float('-inf')
+                probs = torch.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, 1)
+        
+            if key_padding_mask is not None:
+                next_mask = torch.ones((bs, 1), dtype=torch.bool, device=input_ids.device)
+                if finished.any():
+                    next_mask[finished==True] = False
+                key_padding_mask = torch.cat([key_padding_mask, next_mask], dim=-1)             
+        
+            if eos_id is not None:
+                fill_token = pad_id if pad_id is not None else eos_id
+                fill = torch.full_like(next_tokens, fill_token)
+                next_tokens = torch.where(finished, fill, next_tokens)
+                finished = finished | (next_tokens == eos_id)
+
+            output = torch.cat([output, next_tokens], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens], dim=-1)
+            
+            if eos_id is not None and finished.all():
+                break
+        
+        return output
             
         
     
@@ -461,3 +558,25 @@ if __name__ == "__main__":
     # X = torch.randn(bs, seq_len, args.dim)
     # output = feedforward_model(X)
     # print("output shape", output.shape)
+    
+    """这个代码块是用来测试TransformerBlock类的功能的。"""
+    # args = MyModelConfig()
+    
+    # freqs_cos, freqs_sin = precompute_freqs_cs(args.max_seq_len, args.dim // args.n_heads)
+    
+    # transformer_block_model = TransformerBlock(0, args)
+    
+    # bs = 1
+    # seq_len = 50
+    # X = torch.randn(bs, seq_len, args.dim)
+    # output = transformer_block_model(X, freqs_cos[:seq_len], freqs_sin[:seq_len])
+    # print("output shape", output.shape)
+    
+    """这个代码块是用来测试Transformer类的功能的。"""
+    # args = MyModelConfig()
+    # transformer_model = Transformer(args)
+    # bs = 1
+    # seq_len = 50
+    # input_ids = torch.randint(0, args.vocab_size, (bs, seq_len))
+    # output = transformer_model(input_ids)
+    # print("output shape", output.logits.shape)
