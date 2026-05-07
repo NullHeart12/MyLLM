@@ -1,0 +1,31 @@
+# 数据集目录(几十 GB,不上传 GitHub)
+dataset/
+processed_dataset/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# 模型/检查点(通常很大)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# 日志
+*.log
+logs/
