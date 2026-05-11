@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MyModelConfig(PretrainedConfig):
@@ -24,6 +24,9 @@ class MyModelConfig(PretrainedConfig):
         max_seq_len: int = 512,         #the maximum sequence length
         dropout: float = 0.0,           #the dropout rate
         flash_attention: bool = False,  #whether to use flash attention
+        bos_token_id: int = 3,
+        eos_token_id: int = 4,
+        pad_token_id: int = 4,
         **kwargs
     ):
         self.dim = dim
@@ -37,6 +40,9 @@ class MyModelConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.flash_attention = flash_attention
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
 
         super().__init__(**kwargs)
         
@@ -298,7 +304,7 @@ class TransformerBlock(nn.Module):
         return output
     
     
-class Transformer(nn.Module):
+class Transformer(PreTrainedModel):
     config_class = MyModelConfig
     
     def __init__(self, args:MyModelConfig):
@@ -334,6 +340,9 @@ class Transformer(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cs(self.max_seq_len, self.dim // args.n_heads)
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
+        
+        self.eos_token_id = args.eos_token_id
+        self.pad_token_id = args.pad_token_id
         
     def _init_weights(self, module:nn.Module):
         if isinstance(module, nn.Linear):
@@ -441,8 +450,6 @@ class Transformer(nn.Module):
                  top_k:int=None,
                  temperature:float=1.0,
                  key_padding_mask:Optional[torch.Tensor]=None,
-                 pad_id:int=None,
-                 eos_id:int=None
     ):
         """
         这个函数是用来生成文本的。
@@ -452,17 +459,22 @@ class Transformer(nn.Module):
         top_k: 用于top-k采样，表示保留的最高概率token的数量。
         temperature: 用于调整生成文本的多样性，值越小越确定，值越大越随机。
         key_padding_mask: 可选的填充掩码，形状为（batch_size, seq_len）。其中True表示有效的token，False表示需要填充的位置。
-        pad_id: 用于填充的token ID。
-        eos_id: 句子结束符的token ID。
         输出：
         output: 生成的token ID张量，形状为（batch_size, generated_seq_len）。其中generated_seq_len是根据max_new_tokens和输入序列长度计算得到的实际生成长度。
         """
         bs, _ = input_ids.shape
         
-        if pad_id is None:
-            pad_id = self.args.pad_token_id if self.args.pad_token_id is not None else 0
-        if eos_id is None:
-            eos_id = self.args.eos_token_id
+        if self.eos_token_id is not None:
+            eos_id = self.eos_token_id
+        else:
+            raise ValueError(
+                "eos_token_id is required for generation but was not set in the model config."
+            )
+        
+        if self.pad_token_id is not None:
+            pad_id = self.pad_token_id
+        else:
+            pad_id = self.eos_token_id
         
         key_padding_mask = self._prepare_padding_mask(key_padding_mask, input_ids)
         input_ids, key_padding_mask = \
@@ -471,12 +483,11 @@ class Transformer(nn.Module):
         finished = torch.zeros(bs, 1, dtype=torch.bool, device=input_ids.device)
         output = input_ids.new_empty((bs, 0))
         
-        for i in range(max_new_tokens):
-            input_ids = input_ids if input_ids.shape[1] <= self.max_seq_len \
-                else input_ids[:, -self.max_seq_len:]
-            if key_padding_mask is not None:
-                key_padding_mask = key_padding_mask if key_padding_mask.shape[1] \
-                    <= self.max_seq_len else key_padding_mask[:, -self.max_seq_len:]
+        for _ in range(max_new_tokens):                    
+            if input_ids.shape[1] > self.max_seq_len:
+                input_ids = input_ids[:, -self.max_seq_len:]
+                if key_padding_mask is not None:
+                    key_padding_mask = key_padding_mask[:, -self.max_seq_len:]
             
             logits = self(input_ids, key_padding_mask=key_padding_mask).logits[:, -1, :]
             
@@ -496,16 +507,15 @@ class Transformer(nn.Module):
                     next_mask[finished==True] = False
                 key_padding_mask = torch.cat([key_padding_mask, next_mask], dim=-1)             
         
-            if eos_id is not None:
-                fill_token = pad_id if pad_id is not None else eos_id
-                fill = torch.full_like(next_tokens, fill_token)
-                next_tokens = torch.where(finished, fill, next_tokens)
-                finished = finished | (next_tokens == eos_id)
+            fill_token = pad_id
+            fill = torch.full_like(next_tokens, fill_token)
+            next_tokens = torch.where(finished, fill, next_tokens)
+            finished = finished | (next_tokens == eos_id)
 
             output = torch.cat([output, next_tokens], dim=-1)
             input_ids = torch.cat([input_ids, next_tokens], dim=-1)
             
-            if eos_id is not None and finished.all():
+            if finished.all():
                 break
         
         return output

@@ -3,11 +3,15 @@
 # 设置环境变量
 export HF_ENDPOINT=https://hf-mirror.com
 
-# dataset dir 下载到本地目录
-dataset_dir="./dataset"
+# 以脚本所在目录为基准定位项目根,数据集统一放在 <项目根>/dataset
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+dataset_dir="${PROJECT_ROOT}/dataset"
+
+mkdir -p "${dataset_dir}"
 
 # 下载预训练数据集， 需要预先安装modelscope，使用pip3 install modelscope安装
-modelscope download --dataset ddzhu123/seq-monkey mobvoi_seq_monkey_general_open_corpus.jsonl.tar.bz2 --local_dir ${dataset_dir}
+modelscope download --dataset ddzhu123/seq-monkey mobvoi_seq_monkey_general_open_corpus.jsonl.tar.bz2 --local_dir "${dataset_dir}"
 
 # 解压预训练数据集
 tar -xvf "${dataset_dir}/mobvoi_seq_monkey_general_open_corpus.jsonl.tar.bz2" -C "${dataset_dir}"
