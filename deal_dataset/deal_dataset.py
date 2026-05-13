@@ -1,7 +1,7 @@
 import json
-from tqdm import tqdm
-
 import os
+
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,10 +16,12 @@ TOKENIZER_DIR = os.path.join(PROJECT_ROOT, 'tokenizer_k')
 CHUNK_SIZE = 512   # 与模型 max_seq_len 对齐
 
 
-# 1 处理预训练数据(token 级 packing)
-if os.path.exists(output_pretrain_data):
-    print(f"Skip pretrain: {output_pretrain_data} already exists")
-else:
+def process_pretrain():
+    """处理预训练数据(token 级 packing)"""
+    if os.path.exists(output_pretrain_data):
+        print(f"Skip pretrain: {output_pretrain_data} already exists")
+        return
+
     if not os.path.exists(TOKENIZER_DIR):
         raise FileNotFoundError(
             f"Tokenizer not found at {TOKENIZER_DIR}. "
@@ -27,6 +29,8 @@ else:
         )
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
     eos_id = tokenizer.eos_token_id
+
+    os.makedirs(os.path.dirname(output_pretrain_data), exist_ok=True)
 
     buffer = []        # 跨文档的 token 缓冲区
     n_samples = 0      # 已写出的样本数
@@ -51,11 +55,9 @@ else:
     print(f"Packed {n_samples} samples ({CHUNK_SIZE} tokens each). "
           f"Discarded {len(buffer)} tail tokens.")
 
-# 2 处理SFT数据
+
 def convert_message(data):
-    """
-    将原始数据转换为标准格式
-    """
+    """将原始 SFT 数据转换为标准 messages 格式"""
     message = [
         {"role": "system", "content": "你是一个AI助手"},
     ]
@@ -66,12 +68,23 @@ def convert_message(data):
             message.append({'role': 'assistant', 'content': item['value']})
     return message
 
-if os.path.exists(output_sft_data):
-    print(f"Skip sft: {output_sft_data} already exists")
-else:
+
+def process_sft():
+    """处理 SFT 数据"""
+    if os.path.exists(output_sft_data):
+        print(f"Skip sft: {output_sft_data} already exists")
+        return
+
+    os.makedirs(os.path.dirname(output_sft_data), exist_ok=True)
+
     with open(output_sft_data, 'w', encoding='utf-8') as write_sft:
         with open(read_sft_data, 'r', encoding='utf-8') as read_sft:
             for item in tqdm(read_sft, desc="Processing sft", leave=False, unit="lines"):
                 item = json.loads(item)
                 message = convert_message(item['conversations'])
                 write_sft.write(json.dumps(message, ensure_ascii=False) + '\n')
+
+
+if __name__ == "__main__":
+    process_pretrain()
+    process_sft()

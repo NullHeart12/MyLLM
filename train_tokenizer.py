@@ -58,7 +58,8 @@ def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192) -> No
         "<s>", 
         "</s>", 
         "<|im_start|>", 
-        "<|im_end|>"
+        "<|im_end|>",
+        "<pad>"
     ]
 
     # 配置训练器
@@ -82,6 +83,7 @@ def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192) -> No
         assert tokenizer.token_to_id("</s>") == 2
         assert tokenizer.token_to_id("<|im_start|>") == 3
         assert tokenizer.token_to_id("<|im_end|>") == 4
+        assert tokenizer.token_to_id("<pad>") == 5
     except AssertionError as e:
         print("Special tokens mapping error:", e)
         raise
@@ -91,7 +93,7 @@ def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192) -> No
         tokenizer_object=tokenizer,
         bos_token="<|im_start|>",
         eos_token="<|im_end|>",
-        pad_token="<|im_end|>",
+        pad_token="<pad>",
         unk_token="<unk>",
         additional_special_tokens=["<s>", "</s>"],
         chat_template=CHAT_TEMPLATE,

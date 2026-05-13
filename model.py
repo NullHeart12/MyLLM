@@ -24,9 +24,9 @@ class MyModelConfig(PretrainedConfig):
         max_seq_len: int = 512,         #the maximum sequence length
         dropout: float = 0.0,           #the dropout rate
         flash_attention: bool = False,  #whether to use flash attention
-        bos_token_id: int = 3,
-        eos_token_id: int = 4,
-        pad_token_id: int = 4,
+        bos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
         **kwargs
     ):
         self.dim = dim
@@ -43,6 +43,14 @@ class MyModelConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
+        
+        # assert self.dim % self.n_heads == 0, "dim must be divisible by n_heads"
+        # assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+        # assert self.hidden_dim is None or self.hidden_dim % self.multiple_of == 0, "hidden_dim must be a multiple of multiple_of"
+        # assert self.hidden_dim is None or self.hidden_dim >= self.dim, "hidden_dim must be greater than or equal to dim"
+        assert bos_token_id is not None, "bos_token_id must be specified"
+        assert eos_token_id is not None, "eos_token_id must be specified"
+        assert pad_token_id is not None, "pad_token_id must be specified"     
 
         super().__init__(**kwargs)
         
@@ -70,20 +78,20 @@ def precompute_freqs_cs(seq_len: int, dim: int, theta: float = 10000.0):
     位置编码是一种用于Transformer模型中的技术，用于为输入序列中的每个位置提供唯一的表示。
     这个函数通过计算不同频率的正弦和余弦函数来生成位置编码的频率矩阵。
     但是和LLaMA官方计算不同的是，这里对每个值计算了两遍
-    
+
     参数：
     seq_len: 输入序列的长度。
     dim: 模型的维度。这里是每个头的维度，而不是整个模型的维度。
     theta: 频率的基数，默认值为10000.0。
-    
+
     输出：
     freqs_cos: 位置编码的余弦频率矩阵。形状为（seq_len, dim）。
     freqs_sin: 位置编码的正弦频率矩阵。形状为（seq_len, dim）。
     """
-    
-    freqs = 1.0 / theta ** (2 * (torch.arange(dim) // 2).float() / dim)
-    idx = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(idx, freqs).float()
+
+    freqs = 1.0 / theta ** (2 * (torch.arange(dim, dtype=torch.float32) // 2) / dim)
+    idx = torch.arange(seq_len, dtype=torch.float32)
+    freqs = torch.outer(idx, freqs)
     freqs_cos = torch.cos(freqs)
     freqs_sin = torch.sin(freqs)
     return freqs_cos, freqs_sin
@@ -167,23 +175,16 @@ class Attention(nn.Module):
         assert self.n_heads % self.n_kv_heads == 0
         self.n_reps = self.n_heads // self.n_kv_heads
         self.dropout = args.dropout
-        
-        """这里的代码是用来设置模型并行的相关参数的。但是在该处为无效设置，
-        因为需要使用fairscale或者torch.distributed来实现模型并行，并且需要在训练脚本中进行相应的设置和调用。
-        后续计划添加相关设置"""      
-        self.model_parallel_size = 1
-        self.n_local_heads = self.n_heads // self.model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // self.model_parallel_size
-        
+
         self.Wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
         self.Wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.Wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.Wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
-        
+
         self.attn_dropout = nn.Dropout(self.dropout)
-        self.resi_dropout = nn.Dropout(self.dropout)
-        
-        self.flash = hasattr(F, "scaled_dot_product_attention")        
+        self.resid_dropout = nn.Dropout(self.dropout)
+
+        self.flash = args.flash_attention and hasattr(F, "scaled_dot_product_attention")
         
     def forward(self, 
                 X: torch.Tensor,
@@ -205,9 +206,9 @@ class Attention(nn.Module):
         
         Xq, Xk, Xv = self.Wq(X), self.Wk(X), self.Wv(X)
         
-        Xq = Xq.view(bs, seq_len, self.n_local_heads, self.head_dim)
-        Xk = Xk.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
-        Xv = Xv.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
+        Xq = Xq.view(bs, seq_len, self.n_heads, self.head_dim)
+        Xk = Xk.view(bs, seq_len, self.n_kv_heads, self.head_dim)
+        Xv = Xv.view(bs, seq_len, self.n_kv_heads, self.head_dim)
         
         Xq, Xk = apply_rotary_positional_embedding(Xq, Xk, freqs_cos, freqs_sin)
         
@@ -223,8 +224,8 @@ class Attention(nn.Module):
         
         if self.flash:
             if key_padding_mask is not None:
-                casual_mask = torch.full((1, 1, seq_len, seq_len), 1, dtype=torch.bool, device=key_padding_mask.device).tril()
-                attn_mask = key_padding_mask & casual_mask
+                causal_mask = torch.full((1, 1, seq_len, seq_len), 1, dtype=torch.bool, device=key_padding_mask.device).tril()
+                attn_mask = key_padding_mask & causal_mask
                 attention = F.scaled_dot_product_attention(
                     Xq,
                     Xk,
@@ -245,14 +246,14 @@ class Attention(nn.Module):
             scores = torch.matmul(Xq, Xk.transpose(2, 3)) / sqrt(self.head_dim)
             if key_padding_mask is not None:
                 scores = scores.masked_fill(~key_padding_mask, float('-inf'))
-            casual_mask = torch.full((1, 1, seq_len, seq_len), float('-inf'), device=Xq.device).triu(diagonal=1)
-            scores = scores + casual_mask
+            causal_mask = torch.full((1, 1, seq_len, seq_len), float('-inf'), device=Xq.device).triu(diagonal=1)
+            scores = scores + causal_mask
             scores = torch.softmax(scores.float(), dim=-1).type_as(scores)
             attention = self.attn_dropout(scores).matmul(Xv)
-        
+
         attention = attention.transpose(1, 2).contiguous().view(bs, seq_len, -1)
-        
-        output = self.resi_dropout(attention)
+
+        output = self.resid_dropout(attention)
         output = self.Wo(output)
         return output
 
@@ -308,7 +309,7 @@ class Transformer(PreTrainedModel):
     config_class = MyModelConfig
     
     def __init__(self, args:MyModelConfig):
-        super().__init__()
+        super().__init__(args)
         
         self.args = args
         self.vocab_size = args.vocab_size
@@ -337,7 +338,10 @@ class Transformer(PreTrainedModel):
                 nn.init.normal_(p, mean=0, std=0.02 / sqrt(2 * self.n_layers))
         
         self.max_seq_len = args.max_seq_len
-        freqs_cos, freqs_sin = precompute_freqs_cs(self.max_seq_len, self.dim // args.n_heads)
+        freqs_cos, freqs_sin = precompute_freqs_cs(
+                                    self.max_seq_len,
+                                    self.dim // args.n_heads,
+                                )
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
         
@@ -387,18 +391,25 @@ class Transformer(PreTrainedModel):
         if key_padding_mask is None or key_padding_mask.all():
             return tokens, key_padding_mask
 
-        bsz = tokens.shape[0]
         lengths = key_padding_mask.sum(dim=1)
-        max_len = lengths.max().item()
-        
-        new_tokens = tokens.new_full((bsz, max_len), pad_id)
-        new_padding_mask = key_padding_mask.new_zeros((bsz, max_len), dtype=torch.bool)
-        
-        for i in range(bsz):
-            cur_len = lengths[i].item()
-            new_tokens[i, -cur_len:] = tokens[i][key_padding_mask[i]]
-            new_padding_mask[i, -cur_len:] = True
-            
+        max_len = int(lengths.max().item())
+
+        # 向量化的好处在于不用每行做一次布尔索引，每次 lengths[i].item() 都要 GPU↔CPU 同步一下。batch 大或者 GPU 上跑就慢。
+        # 用稳定排序把 padding(False) 排到左边、有效 token(True) 排到右边，相对顺序保持不变
+        # sort_key: padding=0, valid=1；升序后 padding 在前，valid 在后
+        sort_key = key_padding_mask.to(torch.int8)
+        order = torch.argsort(sort_key, dim=1, stable=True)
+        sorted_tokens = torch.gather(tokens, 1, order)
+        sorted_mask   = torch.gather(key_padding_mask, 1, order)
+
+        new_tokens = sorted_tokens[:, -max_len:].contiguous()
+        new_padding_mask = sorted_mask[:, -max_len:].contiguous()
+
+        new_tokens = torch.where(
+            new_padding_mask,
+            new_tokens,
+            torch.full_like(new_tokens, pad_id),
+        )
         return new_tokens, new_padding_mask
     
     
@@ -428,14 +439,13 @@ class Transformer(PreTrainedModel):
         
         if labels is not None:
             logits = self.output(x)
-            ignore_index = self.args.pad_token_id if self.args.pad_token_id is not None else 0
-            if torch.any(labels == -100):
-                ignore_index = -100
+            # 固定使用 -100 作为忽略标记。由 dataset 决定哪些位置不计入 loss
+            # （预训练全部参与；SFT 阶段把 prompt 部分填 -100）
             loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1),
-                ignore_index=ignore_index,
-                reduction="none"
+                ignore_index=-100,
+                reduction="mean"
             )
         else:
             logits = self.output(x[:, [-1], :])#采用left_padding
