@@ -9,7 +9,7 @@ from tokenizers import (
     Tokenizer,
 )
 from tokenizers.normalizers import NFKC
-from typing import Generator
+from typing import Generator, Optional
 
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
@@ -26,10 +26,12 @@ CHAT_TEMPLATE = (
     "{% endif %}"
 )
 
-def read_texts_from_jsonl(file_path: str) -> Generator[str, None, None]:
+def read_texts_from_jsonl(file_path: str, max_lines: Optional[int] = None) -> Generator[str, None, None]:
     """读取JSONL文件并安全提取文本数据"""
     with open(file_path, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f):
+            if max_lines is not None and line_num >= max_lines:
+                break
             try:
                 data = json.loads(line)
                 if 'text' not in data:
@@ -42,7 +44,7 @@ def read_texts_from_jsonl(file_path: str) -> Generator[str, None, None]:
                 print(e)
                 continue
 
-def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192) -> None:
+def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192, max_lines: Optional[int] = None) -> None:
     """训练并保存自定义tokenizer"""
     os.makedirs(save_dir, exist_ok=True)
     
@@ -66,15 +68,17 @@ def train_tokenizer(data_path: str, save_dir: str, vocab_size: int = 8192) -> No
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=special_tokens,
-        min_frequency=2,  # 提高低频词过滤
+        min_frequency=5,  # 提高低频词过滤
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
     )
 
     # 训练tokenizer
-    print(f"Training tokenizer with data from {data_path}")
-    texts = read_texts_from_jsonl(data_path)
-    tokenizer.train_from_iterator(texts, trainer=trainer, length=os.path.getsize(data_path))
+    print(f"Training tokenizer with data from {data_path} (max_lines={max_lines})")
+    texts = read_texts_from_jsonl(data_path, max_lines=max_lines)
+    # length 仅用于进度条估算，子集时按行数给，否则按文件大小
+    length = max_lines if max_lines is not None else os.path.getsize(data_path)
+    tokenizer.train_from_iterator(texts, trainer=trainer, length=length)
 
     # 验证特殊token映射
     try:
@@ -157,14 +161,23 @@ def eval_tokenizer(tokenizer_path: str) -> None:
 def main():
     # 以脚本所在目录为基准定位路径,避免依赖 CWD
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     data_path = os.path.join(PROJECT_ROOT, "dataset", "mobvoi_seq_monkey_general_open_corpus.jsonl")
     save_dir = os.path.join(PROJECT_ROOT, "tokenizer_k")
 
     # 训练tokenizer
+    # max_lines=None 用全量数据；调试时设成 100000 之类的小数
+    # train_tokenizer(
+    #     data_path=data_path,
+    #     save_dir=save_dir,
+    #     vocab_size=6144,
+    #     max_lines=None,
+    # )
     train_tokenizer(
         data_path=data_path,
         save_dir=save_dir,
-        vocab_size=6144
+        vocab_size=6144,
+        max_lines=500000,
     )
 
     # 评估tokenizer

@@ -18,6 +18,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.ipynb_checkpoints/
 
 # 模型/检查点(通常很大)
 *.pt
@@ -29,3 +30,7 @@ env/
 # 日志
 *.log
 logs/
+
+# SwanLab 实验记录
+swanlog/
+.swanlab/

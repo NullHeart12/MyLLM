@@ -37,16 +37,15 @@ def load_tokenizer(tokenizer_path:str):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     return tokenizer
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 def load_model(
     lm_config:MyModelConfig,
     args:argparse.Namespace
 ) -> DDP:
-    
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
     my_model = Transformer(lm_config)
-    my_model = my_model.to(lm_config.device)
+    my_model = my_model.to(args.device)
     my_model = DDP(
         my_model,
         device_ids=[args.local_rank],
@@ -139,14 +138,15 @@ def epoch_train(
                 args: argparse.Namespace,
                 start_step: int = 0,
     ):
-    start_time = time.time()
-
     all_steps = len(data_loader)
+    start_time = None  # 在跳过 resume 之前的步骤后再启动计时
 
     for step, batch in enumerate(data_loader):
         # resume 时跳过已经训过的 step
         if step < start_step:
             continue
+        if start_time is None:
+            start_time = time.time()
 
         input_ids = batch['input_ids'].to(args.device)
         labels = batch['labels'].to(args.device)
@@ -183,15 +183,22 @@ def epoch_train(
             if args.is_main:
                 display_loss = loss_for_log.item() * args.gradient_accumulation_steps
                 spent_time = time.time() - start_time
+                # 用"本次运行已跑的步数"做平均，避免 resume 后被绝对步号稀释
+                steps_done_this_run = (step + 1) - start_step
+                sec_per_step = spent_time / max(1, steps_done_this_run)
+                remaining_steps = all_steps - (step + 1)
+                elapsed_min = spent_time / 60
+                remain_min = remaining_steps * sec_per_step / 60
+                total_min = elapsed_min + remain_min
                 logger(
-                    'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min;'.format(
+                    'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} elapsed:{:.0f}min remain:{:.0f}min total:{:.0f}min;'.format(
                     epoch + 1,
                     args.epochs,
-                    step,
+                    step + 1,
                     all_steps,
                     display_loss,
                     optimizer.param_groups[-1]['lr'],
-                    spent_time / (step + 1) * all_steps // 60 - spent_time // 60)
+                    elapsed_min, remain_min, total_min)
                 )
 
                 if args.use_swanlab:
@@ -204,7 +211,7 @@ def epoch_train(
             model.eval()
             save_path = os.path.join(
                     args.save_dir,
-                    f"pretrain_{epoch}_{step + 1}.pt"
+                    f"pretrain_param_count{count_parameters(model) / 1e6:.3f}M.pt"
                 )
             save_checkpoint(
                 save_path, model, optimizer, scaler, lm_config,
@@ -220,11 +227,12 @@ def epoch_train(
             os.makedirs(snap_dir, exist_ok=True)
             save_path = os.path.join(
                     snap_dir,
-                    f"pretrain_{epoch}_{step + 1}.pt"
+                    f"snapshot_step{step + 1}_param_count{count_parameters(model) / 1e6:.3f}M.pt"
                 )
             save_checkpoint(
                 save_path, model, optimizer, scaler, lm_config,
                 epoch=epoch, step=step + 1,
                 global_step=step + 1 + epoch * all_steps,
             )
+            logger(f"快照已保存到 {save_path}")
             model.train()

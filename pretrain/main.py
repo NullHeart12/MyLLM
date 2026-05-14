@@ -2,7 +2,7 @@ import os
 import argparse
 
 from model import MyModelConfig
-from ddp_pretrain import (
+from .ddp_pretrain import (
     set_ddp, destroy_ddp, logger,
     load_tokenizer, load_model,
     build_optimizer, maybe_resume,
@@ -17,7 +17,8 @@ from torch import amp
 from torch.utils import data
 
 if __name__ == "__main__":
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     
     parser = argparse.ArgumentParser(description="using DDP Pretrain MyLLM")
     
@@ -26,35 +27,38 @@ if __name__ == "__main__":
                         default=os.path.join(PROJECT_ROOT, "base_model"), 
                         help="模型输出目录")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help="每张卡的批次大小（DDP 约定）。全局有效 batch = batch_size × world_size × gradient_accumulation_steps")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="学习率")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型: float16 / bfloat16 / float32")
 
     # 实验跟踪和数据加载参数
     parser.add_argument("--use_swanlab", action="store_true", help="是否使用SwanLab进行实验跟踪")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载的工作进程数")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载的工作进程数")
     parser.add_argument("--data_path", type=str, 
                         default=os.path.join(PROJECT_ROOT, "processed_dataset", "seq_monkey.jsonl"), 
                         help="训练数据路径")
 
     # 训练优化参数
     parser.add_argument("--gradient_accumulation_steps", 
-                        type=int, default=8, help="梯度累积步数")
+                        type=int, default=2, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="学习率预热迭代次数")
+    parser.add_argument("--warmup_iters", type=int, default=750, help="学习率预热迭代次数")
     parser.add_argument("--weight_decay", type=float, default=0.1, 
                         help="AdamW weight decay")
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95), 
                         help="AdamW betas")
 
     # 日志和保存参数
-    parser.add_argument("--log_interval", type=int, default=100, help="日志记录间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument("--snapshot_interval", type=int, default=500, help="生成快照间隔")
+    parser.add_argument("--log_interval", type=int, default=150, help="日志记录间隔")
+    parser.add_argument("--save_interval", type=int, default=2000, help="模型保存间隔")
+    parser.add_argument("--snapshot_interval", type=int, default=50000, help="生成快照间隔")
 
     # 断点续训
-    parser.add_argument("--resume", type=str, default=None, help="从指定 checkpoint 路径恢复训练")
+    parser.add_argument("--resume", type=str, 
+                        default=None,
+                        # default=os.path.join(PROJECT_ROOT, "base_model", "pretrain_param_count82.595M.pt"), 
+                        help="从指定 checkpoint 路径恢复训练")
 
     args = parser.parse_args()
 
@@ -73,6 +77,14 @@ if __name__ == "__main__":
     args.is_main = (args.rank == 0)
     logger(f"ddp 初始化完成，world_size:{args.world_size}，backend=nccl")
 
+    # 打印训练配置
+    if args.is_main:
+        logger("=" * 60)
+        logger("训练参数配置:")
+        for k, v in sorted(vars(args).items()):
+            logger(f"  {k:30s} = {v}")
+        logger("=" * 60)
+
     # SwanLab 实验跟踪
     if args.use_swanlab and args.is_main:
         swanlab.init(
@@ -85,14 +97,30 @@ if __name__ == "__main__":
     torch.manual_seed(42)  # 设置随机种子以确保每个进程加载相同的模型权重
     tokenizer = load_tokenizer(os.path.join(PROJECT_ROOT, "tokenizer_k"))
     
+    # lm_config = MyModelConfig(
+    #     vocab_size=tokenizer.vocab_size,
+    #     dropout=0.1,
+    #     flash_attention=True,
+    #     bos_token_id=tokenizer.bos_token_id,
+    #     eos_token_id=tokenizer.eos_token_id,
+    #     pad_token_id=tokenizer.pad_token_id,
+    # )
+    
     lm_config = MyModelConfig(
-        vocab_size=tokenizer.vocab_size,
-        dropout=0.1,
-        flash_attention=True,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+    dim=1024,                 # 768 → 1024
+    n_layers=30,              # 12 → 30  (~354M)，或 34 (~400M)
+    n_heads=16,               # 不变（head_dim=1024/16=64，对 tensor core 友好）
+    n_kv_heads=8,             # 不变（GQA 比例 2，节省 KV cache）
+    vocab_size=tokenizer.vocab_size,
+    max_seq_len=512,          # 不变
+    multiple_of=64,           # 不变
+    dropout=0.1,
+    flash_attention=True,
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
+
     
     my_model = load_model(lm_config, args)
     
