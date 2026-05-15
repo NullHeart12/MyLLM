@@ -339,7 +339,7 @@ class Transformer(PreTrainedModel):
         
         self.max_seq_len = args.max_seq_len
         freqs_cos, freqs_sin = precompute_freqs_cs(
-                                    self.max_seq_len,
+                                    self.max_seq_len * 2,
                                     self.dim // args.n_heads,
                                 )
         self.register_buffer("freqs_cos", freqs_cos)
@@ -433,8 +433,13 @@ class Transformer(PreTrainedModel):
         x = self.dropout(x)
         
         for layer in self.layers:
-            x = layer(x, self.freqs_cos[:seq_len, :], self.freqs_sin[:seq_len, :], key_padding_mask)
-            
+            x = layer(
+                x, 
+                self.freqs_cos[:seq_len, :],
+                self.freqs_sin[:seq_len, :], 
+                key_padding_mask
+            )
+    
         x = self.RMSNorm(x)
         
         if labels is not None:
