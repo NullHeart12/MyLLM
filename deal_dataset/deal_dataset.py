@@ -14,7 +14,7 @@ read_sft_data        = os.path.join(PROJECT_ROOT, 'dataset', 'BelleGroup', 'trai
 output_sft_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'BelleGroup_sft.jsonl')
 
 TOKENIZER_DIR = os.path.join(PROJECT_ROOT, 'tokenizer_k')
-CHUNK_SIZE = 512   # 与模型 max_seq_len 对齐
+CHUNK_SIZE = 1024   # 与模型 max_seq_len 对齐
 
 
 BATCH_SIZE = 5000              # 批量 tokenize 的批大小

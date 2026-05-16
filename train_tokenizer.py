@@ -160,8 +160,8 @@ def eval_tokenizer(tokenizer_path: str) -> None:
 
 def main():
     # 以脚本所在目录为基准定位路径,避免依赖 CWD
-    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-    # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
+    # PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     data_path = os.path.join(PROJECT_ROOT, "dataset", "mobvoi_seq_monkey_general_open_corpus.jsonl")
     save_dir = os.path.join(PROJECT_ROOT, "tokenizer_k")
 
@@ -176,8 +176,8 @@ def main():
     train_tokenizer(
         data_path=data_path,
         save_dir=save_dir,
-        vocab_size=6144,
-        max_lines=500000,
+        vocab_size=25600,
+        max_lines=700000,
     )
 
     # 评估tokenizer
