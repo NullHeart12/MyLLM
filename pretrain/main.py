@@ -99,7 +99,6 @@ if __name__ == "__main__":
     
     # lm_config = MyModelConfig(
     #     vocab_size=tokenizer.vocab_size,
-    #     dropout=0.1,
     #     flash_attention=True,
     #     bos_token_id=tokenizer.bos_token_id,
     #     eos_token_id=tokenizer.eos_token_id,
@@ -107,19 +106,12 @@ if __name__ == "__main__":
     # )
     
     lm_config = MyModelConfig(
-    dim=1024,                 # 768 → 1024
-    n_layers=30,              # 12 → 30  (~354M)，或 34 (~400M)
-    n_heads=16,               # 不变（head_dim=1024/16=64，对 tensor core 友好）
-    n_kv_heads=8,             # 不变（GQA 比例 2，节省 KV cache）
-    vocab_size=tokenizer.vocab_size,
-    max_seq_len=512,          # 不变
-    multiple_of=64,           # 不变
-    dropout=0.1,
-    flash_attention=True,
-    bos_token_id=tokenizer.bos_token_id,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-)
+        vocab_size=tokenizer.vocab_size,
+        flash_attention=True,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     
     my_model = load_model(lm_config, args)

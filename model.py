@@ -2,7 +2,7 @@ from math import sqrt
 from typing import Optional
 
 import torch
-from torch import nn, topk
+from torch import nn
 from torch.nn import functional as F
 
 from transformers import PretrainedConfig, PreTrainedModel
@@ -13,15 +13,19 @@ class MyModelConfig(PretrainedConfig):
 
     def __init__(
         self,
-        dim: int = 768,                 #the dimension of the model
-        n_layers: int = 12,             #the layers of the Transformer
+        dim: int = 1024,                 #the dimension of the model
+        n_layers: int = 28,             #the layers of the Transformer
         n_heads: int = 16,              #the heads of the multi-head attention
-        n_kv_heads: int = 8,            #the heads of the key-value attention
-        vocab_size: int = 6144,         #the vocabulary size
+        n_kv_heads: int = 4,            #the heads of the key-value attention
+        vocab_size: int = 25600,        #the vocabulary size
         hidden_dim: int = None,         #the hidden dimension of the MLP
         multiple_of: int = 64,          #
+        use_moe: bool = False,
+        n_experts: int = 8,
+        moe_top_k: int = 3,
+        router_aux_loss_coef: float = 1e-2,
         norm_eps: float = 1e-5,         #the epsilon for layer normalization
-        max_seq_len: int = 512,         #the maximum sequence length
+        max_seq_len: int = 1024,        #the maximum sequence length
         dropout: float = 0.0,           #the dropout rate
         flash_attention: bool = False,  #whether to use flash attention
         bos_token_id: Optional[int] = None,
@@ -40,17 +44,53 @@ class MyModelConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.flash_attention = flash_attention
+        self.use_moe = use_moe
+        self.n_experts = n_experts
+        self.moe_top_k = moe_top_k
+        self.router_aux_loss_coef = router_aux_loss_coef
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
-        
-        # assert self.dim % self.n_heads == 0, "dim must be divisible by n_heads"
-        # assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
-        # assert self.hidden_dim is None or self.hidden_dim % self.multiple_of == 0, "hidden_dim must be a multiple of multiple_of"
-        # assert self.hidden_dim is None or self.hidden_dim >= self.dim, "hidden_dim must be greater than or equal to dim"
+
+        # ---- 基础维度 ----
+        assert self.dim > 0, "dim must be positive"
+        assert self.n_layers > 0, "n_layers must be positive"
+        assert self.vocab_size > 0, "vocab_size must be positive"
+        assert self.max_seq_len > 0, "max_seq_len must be positive"
+        assert self.multiple_of > 0, "multiple_of must be positive"
+
+        # ---- 注意力相关 ----
+        assert self.n_heads > 0, "n_heads must be positive"
+        assert self.n_kv_heads is None or self.n_kv_heads > 0, "n_kv_heads must be positive"
+        assert self.dim % self.n_heads == 0, \
+            f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+        if self.n_kv_heads is not None:
+            assert self.n_heads % self.n_kv_heads == 0, \
+                f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+            assert self.n_kv_heads <= self.n_heads, \
+                "n_kv_heads must not exceed n_heads"
+
+        # ---- FFN 相关 ----
+        if self.hidden_dim is not None:
+            assert self.hidden_dim > 0, "hidden_dim must be positive"
+            assert self.hidden_dim % self.multiple_of == 0, \
+                f"hidden_dim ({self.hidden_dim}) must be a multiple of multiple_of ({self.multiple_of})"
+
+        # ---- 正则/数值 ----
+        assert 0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)"
+        assert self.norm_eps > 0, "norm_eps must be positive"
+
+        # ---- MoE 相关 ----
+        if self.use_moe:
+            assert self.n_experts > 0, "n_experts must be positive when use_moe=True"
+            assert 1 <= self.moe_top_k <= self.n_experts, \
+                f"moe_top_k ({self.moe_top_k}) must be in [1, n_experts={self.n_experts}]"
+            assert self.router_aux_loss_coef >= 0, "router_aux_loss_coef must be non-negative"
+
+        # ---- 特殊 token ----
         assert bos_token_id is not None, "bos_token_id must be specified"
         assert eos_token_id is not None, "eos_token_id must be specified"
-        assert pad_token_id is not None, "pad_token_id must be specified"     
+        assert pad_token_id is not None, "pad_token_id must be specified"
 
         super().__init__(**kwargs)
         
@@ -304,27 +344,76 @@ class MoEFeedForward(nn.Module):
             FeedForward(dim, hidden_dim, multiple_of, dropout)
             for _ in range(n_experts)
         ])
+    
+    # old version        
+    # def forward(self, x:torch.Tensor):
+    #     bs, seq_len, dim = x.shape
+    #     x_flaten = x.view(-1, dim)
+    #     scores = F.softmax(self.gate(x_flaten), dim=-1)
+    #     topk_weights, topk_ids = torch.topk(scores, k=self.top_k, dim=-1)
+    #     topk_weights = topk_weights / torch.sum(topk_weights, dim=-1, keepdim=True)
         
+    #     y = x.new_zeros(bs * seq_len, dim)
+    #     for i, expert in enumerate(self.experts):
+    #         chosen = (topk_ids == i)
+    #         if chosen.any():
+    #             tokens = chosen.any(-1).nonzero().squeeze(1)
+    #             weight_for_i = topk_weights[chosen].sum(-1)
+    #             weights = weight_for_i[tokens].view(-1, 1)
+    #             y[tokens] += weights * expert(x_flaten[tokens])
+    #         elif self.training:
+    #             y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        
+    #     if self.training and self.router_aux_loss_coef > 0:
+    #         one_hot = F.one_hot(topk_ids, num_classes=self.n_experts).float()
+    #         tokens_per_expert = one_hot.sum(dim=(0, 1))
+    #         f = tokens_per_expert / (bs * seq_len * self.top_k)
+                
+    #         P = scores.mean(dim=0)
+            
+    #         self.loss = self.n_experts * (f * P).sum() * self.router_aux_loss_coef
+    #     else:
+            # self.loss = x.new_tensor(0.0)   # 或 torch.tensor(0.0, device=x.device)
+        
+    #     return y.view(bs, seq_len, dim) 
+    
     def forward(self, x:torch.Tensor):
         bs, seq_len, dim = x.shape
-        x_flaten = x.view(-1, dim)
-        scores = F.softmax(self.gate(x_flaten), dim=-1)
-        topk_weights, topk_ids = torch.topk(scores, k=self.top_k, dim=-1)
-        topk_weights = topk_weights / torch.sum(topk_weights, dim=-1, keepdim=True)
+        x_flat = x.view(-1, dim)
+        scores = F.softmax(self.gate(x_flat), dim=-1)
+        
+        topk_expert_weights, topk_expert_ids = torch.topk(
+            scores, k=self.top_k, dim=-1
+        )
+        topk_expert_weights = topk_expert_weights / topk_expert_weights.sum(dim=-1, keepdim=True)
+        
+        flat_expert_ids = topk_expert_ids.view(-1)
+        flat_weights = topk_expert_weights.view(-1)
+        flat_token_ids = torch.arange(bs * seq_len, device=x.device).repeat_interleave(self.top_k)
+        
+        sorted_expert_ids, indices = torch.sort(flat_expert_ids)
+        sorted_weights = flat_weights[indices]
+        sorted_token_ids = flat_token_ids[indices]
+        
+        tokens_per_expert = torch.bincount(sorted_expert_ids, minlength=self.n_experts)
+        boundaries = tokens_per_expert.cumsum(0).tolist()
         
         y = x.new_zeros(bs * seq_len, dim)
+        prev = 0
         for i, expert in enumerate(self.experts):
-            chosen = (topk_ids == i)
-            if chosen.any():
-                tokens = chosen.any(-1).nonzero().squeeze(1)
-                weight_for_i = topk_weights[chosen].sum(-1)
-                weights = weight_for_i[tokens].view(-1, 1)
-                y[tokens] += weights * expert(x_flaten[tokens])
-            elif self.training:
-                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
-        
+            cur = boundaries[i]
+            if cur == prev:
+                if self.training:
+                    y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+                continue
+            token_idx = sorted_token_ids[prev:cur]
+            weights = sorted_weights[prev:cur].view(-1, 1)
+            out_i = weights * expert(x_flat[token_idx])
+            y[token_idx] += out_i
+            prev = cur
+            
         if self.training and self.router_aux_loss_coef > 0:
-            one_hot = F.one_hot(topk_ids, num_classes=self.n_experts).float()
+            one_hot = F.one_hot(topk_expert_ids, num_classes=self.n_experts).float()
             tokens_per_expert = one_hot.sum(dim=(0, 1))
             f = tokens_per_expert / (bs * seq_len * self.top_k)
                 
@@ -332,9 +421,10 @@ class MoEFeedForward(nn.Module):
             
             self.loss = self.n_experts * (f * P).sum() * self.router_aux_loss_coef
         else:
-            self.loss = 0
-        
-        return y.view(bs, seq_len, dim) 
+            self.loss = x.new_tensor(0.0)   # 或 torch.tensor(0.0, device=x.device)
+            
+        return y.view(bs, seq_len, dim)
+
         
 class TransformerBlock(nn.Module):
     """
@@ -349,7 +439,18 @@ class TransformerBlock(nn.Module):
         self.attn_RMSNorm = RMSNorm(args.dim, args.norm_eps)
         self.attention = Attention(args)
         self.FFN_RMSNorm = RMSNorm(args.dim, args.norm_eps)
-        self.FFN = FeedForward(args.dim, args.hidden_dim, args.multiple_of, args.dropout)
+        if args.use_moe:
+            self.FFN = MoEFeedForward(
+                dim=args.dim,
+                hidden_dim=args.hidden_dim,
+                multiple_of=args.multiple_of,
+                dropout=args.dropout,
+                n_experts=args.n_experts,
+                top_k=args.moe_top_k,
+                router_aux_loss_coef=args.router_aux_loss_coef,
+            )
+        else:
+            self.FFN = FeedForward(args.dim, args.hidden_dim, args.multiple_of, args.dropout)
     
     def forward(self, 
                 X:torch.Tensor, 
@@ -498,17 +599,24 @@ class Transformer(PreTrainedModel):
             )
     
         x = self.RMSNorm(x)
-        
+
         if labels is not None:
             logits = self.output(x)
             # 固定使用 -100 作为忽略标记。由 dataset 决定哪些位置不计入 loss
             # （预训练全部参与；SFT 阶段把 prompt 部分填 -100）
-            loss = F.cross_entropy(
+            main_loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1),
                 ignore_index=-100,
                 reduction="mean"
             )
+            # 汇总所有 MoE 层的负载均衡损失;dense 模型或非训练时为 0 tensor
+            aux_loss = sum(
+                (layer.FFN.loss for layer in self.layers
+                 if isinstance(layer.FFN, MoEFeedForward)),
+                start=x.new_tensor(0.0),
+            )
+            loss = main_loss + aux_loss
         else:
             logits = self.output(x[:, [-1], :])#采用left_padding
             loss = None

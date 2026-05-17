@@ -359,8 +359,8 @@ def eval_tokenizer(tokenizer_path: str) -> None:
 
 def main():
     # 以脚本所在目录为基准定位路径,避免依赖 CWD
-    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-    # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
+    # PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     data_path = os.path.join(PROJECT_ROOT, "dataset", "mobvoi_seq_monkey_general_open_corpus.jsonl")
     save_dir = os.path.join(PROJECT_ROOT, "tokenizer_k")
 
