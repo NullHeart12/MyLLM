@@ -2,7 +2,7 @@ from math import sqrt
 from typing import Optional
 
 import torch
-from torch import nn
+from torch import nn, topk
 from torch.nn import functional as F
 
 from transformers import PretrainedConfig, PreTrainedModel
@@ -278,6 +278,63 @@ class FeedForward(nn.Module):
         
     def forward(self, X:torch.Tensor):
         return self.dropout(self.down(F.silu(self.gate(X)) * self.up(X)))
+    
+class MoEFeedForward(nn.Module):
+    def __init__(
+            self, 
+            dim:int, 
+            hidden_dim:int, 
+            multiple_of:int, 
+            dropout:float, 
+            n_experts:int,
+            top_k:int,
+            router_aux_loss_coef:float,
+        ):
+        super().__init__()
+        self.top_k = top_k
+        self.router_aux_loss_coef = router_aux_loss_coef
+        if hidden_dim is None:
+            hidden_dim = dim * 4
+            hidden_dim = 2 * hidden_dim // 3
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of) 
+
+        self.n_experts = n_experts
+        self.gate = nn.Linear(dim, n_experts, bias=False)
+        self.experts = nn.ModuleList([
+            FeedForward(dim, hidden_dim, multiple_of, dropout)
+            for _ in range(n_experts)
+        ])
+        
+    def forward(self, x:torch.Tensor):
+        bs, seq_len, dim = x.shape
+        x_flaten = x.view(-1, dim)
+        scores = F.softmax(self.gate(x_flaten), dim=-1)
+        topk_weights, topk_ids = torch.topk(scores, k=self.top_k, dim=-1)
+        topk_weights = topk_weights / torch.sum(topk_weights, dim=-1, keepdim=True)
+        
+        y = x.new_zeros(bs * seq_len, dim)
+        for i, expert in enumerate(self.experts):
+            chosen = (topk_ids == i)
+            if chosen.any():
+                tokens = chosen.any(-1).nonzero().squeeze(1)
+                weight_for_i = topk_weights[chosen].sum(-1)
+                weights = weight_for_i[tokens].view(-1, 1)
+                y[tokens] += weights * expert(x_flaten[tokens])
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        
+        if self.training and self.router_aux_loss_coef > 0:
+            one_hot = F.one_hot(topk_ids, num_classes=self.n_experts).float()
+            tokens_per_expert = one_hot.sum(dim=(0, 1))
+            f = tokens_per_expert / (bs * seq_len * self.top_k)
+                
+            P = scores.mean(dim=0)
+            
+            self.loss = self.n_experts * (f * P).sum() * self.router_aux_loss_coef
+        else:
+            self.loss = 0
+        
+        return y.view(bs, seq_len, dim) 
         
 class TransformerBlock(nn.Module):
     """
