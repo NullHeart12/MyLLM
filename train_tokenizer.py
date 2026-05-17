@@ -287,7 +287,7 @@ def eval_tokenizer(tokenizer_path: str) -> None:
     for k in ["image_token", "audio_token", "video_token",
               "vision_bos_token", "vision_eos_token",
               "audio_bos_token", "audio_eos_token"]:
-        v = tokenizer.init_kwargs.get(k)
+        v = getattr(tokenizer, k, None) or tokenizer.init_kwargs.get(k)
         tid = tokenizer.convert_tokens_to_ids(v) if v else None
         print(f"  {k}: {v} (id={tid})")
 
