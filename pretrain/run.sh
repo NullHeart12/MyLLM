@@ -55,9 +55,9 @@ torchrun \
     --weight_decay 0.1 \
     --betas 0.9 0.95 \
     `# ===== 日志与保存 =====` \
-    --log_interval 50 \
-    --save_interval 1000 \
-    --snapshot_interval 5000 \
+    --log_interval 20 \
+    --save_interval 500 \
+    --snapshot_interval 2000 \
     `# ===== 模型结构（MyModelConfig） =====` \
     --dim 1024 \
     --n_layers 22 \
