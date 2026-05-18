@@ -40,8 +40,10 @@ if __name__ == "__main__":
                         help="训练数据路径")
 
     # 训练优化参数
-    parser.add_argument("--gradient_accumulation_steps", 
+    parser.add_argument("--gradient_accumulation_steps",
                         type=int, default=2, help="梯度累积步数")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="启用梯度检查点：以重算前向为代价，按 TransformerBlock 粒度减少显存占用")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--warmup_iters", type=int, default=750, help="学习率预热迭代次数")
     parser.add_argument("--weight_decay", type=float, default=0.1, 
@@ -54,10 +56,34 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=2000, help="模型保存间隔")
     parser.add_argument("--snapshot_interval", type=int, default=50000, help="生成快照间隔")
 
+    # 模型结构参数（对应 MyModelConfig）
+    parser.add_argument("--dim", type=int, default=1024, help="hidden dim")
+    parser.add_argument("--n_layers", type=int, default=28, help="Transformer 层数")
+    parser.add_argument("--n_heads", type=int, default=16, help="多头注意力头数（dim 必须能被它整除）")
+    parser.add_argument("--n_kv_heads", type=int, default=4, help="KV 头数（GQA；n_heads 必须能被它整除）")
+    parser.add_argument("--hidden_dim", type=int, default=None,
+                        help="FFN 隐层维度；None 时按 2/3 * 4 * dim 自动计算，并对齐 multiple_of")
+    parser.add_argument("--multiple_of", type=int, default=64, help="FFN hidden_dim 对齐倍数")
+    parser.add_argument("--max_seq_len", type=int, default=1024, help="最大序列长度")
+    parser.add_argument("--norm_eps", type=float, default=1e-5, help="RMSNorm epsilon")
+    parser.add_argument("--model_dropout", type=float, default=0.0,
+                        help="模型内部 dropout 率")
+    parser.add_argument("--flash_attention", action="store_true", default=True,
+                        help="启用 scaled_dot_product_attention(Flash Attn)")
+    parser.add_argument("--no_flash_attention", dest="flash_attention", action="store_false",
+                        help="关闭 Flash Attention（fallback 到手写 attention）")
+
+    # MoE 参数
+    parser.add_argument("--use_moe", action="store_true", help="启用 MoE FFN")
+    parser.add_argument("--n_experts", type=int, default=8, help="MoE 专家数")
+    parser.add_argument("--moe_top_k", type=int, default=3, help="MoE 每 token 路由到的专家数")
+    parser.add_argument("--router_aux_loss_coef", type=float, default=1e-2,
+                        help="MoE 负载均衡辅助损失系数")
+
     # 断点续训
-    parser.add_argument("--resume", type=str, 
+    parser.add_argument("--resume", type=str,
                         default=None,
-                        # default=os.path.join(PROJECT_ROOT, "base_model", "pretrain_param_count82.595M.pt"), 
+                        # default=os.path.join(PROJECT_ROOT, "base_model", "pretrain_param_count82.595M.pt"),
                         help="从指定 checkpoint 路径恢复训练")
 
     args = parser.parse_args()
@@ -97,17 +123,22 @@ if __name__ == "__main__":
     torch.manual_seed(42)  # 设置随机种子以确保每个进程加载相同的模型权重
     tokenizer = load_tokenizer(os.path.join(PROJECT_ROOT, "tokenizer_k"))
     
-    # lm_config = MyModelConfig(
-    #     vocab_size=tokenizer.vocab_size,
-    #     flash_attention=True,
-    #     bos_token_id=tokenizer.bos_token_id,
-    #     eos_token_id=tokenizer.eos_token_id,
-    #     pad_token_id=tokenizer.pad_token_id,
-    # )
-    
     lm_config = MyModelConfig(
+        dim=args.dim,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        n_kv_heads=args.n_kv_heads,
         vocab_size=tokenizer.vocab_size,
-        flash_attention=True,
+        hidden_dim=args.hidden_dim,
+        multiple_of=args.multiple_of,
+        max_seq_len=args.max_seq_len,
+        norm_eps=args.norm_eps,
+        dropout=args.model_dropout,
+        flash_attention=args.flash_attention,
+        use_moe=args.use_moe,
+        n_experts=args.n_experts,
+        moe_top_k=args.moe_top_k,
+        router_aux_loss_coef=args.router_aux_loss_coef,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,

@@ -46,15 +46,26 @@ def load_model(
 ) -> DDP:
     my_model = Transformer(lm_config)
     my_model = my_model.to(args.device)
+
+    # 梯度检查点：必须在 DDP 包裹前启用。
+    # use_reentrant=False 走 saved_tensors_hooks 路径，反向时 DDP reducer 的 hook 注册/触发
+    # 与普通训练一致，所以这里 DDP 不需要 static_graph / find_unused_parameters；
+    # 反过来 static_graph=True 会与训练循环里的 model.no_sync()(梯度累积) 冲突。
+    use_gc = getattr(args, "gradient_checkpointing", False)
+    if use_gc:
+        my_model.gradient_checkpointing_enable(use_reentrant=False)
+        if args.is_main:
+            logger("已启用 gradient checkpointing (use_reentrant=False)")
+
     my_model = DDP(
         my_model,
         device_ids=[args.local_rank],
         output_device=args.local_rank,
     )
-    
+
     if args.is_main:
         logger(f"模型参数数量: {count_parameters(my_model) / 1e6:.3f}M")
-    
+
     return my_model
 
 def update_lr(iteration:int, all_iterations:int, warmup_iters:int, base_lr:float):
@@ -154,7 +165,8 @@ def epoch_train(
         new_lr = update_lr(
             iteration=step + epoch * all_steps,
             all_iterations=all_steps * args.epochs,
-            warmup_iters=args.warmup_iters,
+            # warmup_iters=args.warmup_iters,
+            warmup_iters=all_steps * 0.01,
             base_lr=args.learning_rate
         )
         for param_group in optimizer.param_groups:

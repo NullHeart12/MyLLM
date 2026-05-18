@@ -7,16 +7,17 @@ from torch.nn import functional as F
 
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from torch.utils.checkpoint import checkpoint
 
 class MyModelConfig(PretrainedConfig):
     model_type = "my_model"
 
     def __init__(
         self,
-        dim: int = 1024,                 #the dimension of the model
-        n_layers: int = 28,             #the layers of the Transformer
-        n_heads: int = 16,              #the heads of the multi-head attention
-        n_kv_heads: int = 4,            #the heads of the key-value attention
+        dim: int = 1024,                #the dimension of the model
+        n_layers: int = 24,             #the layers of the Transformer
+        n_heads: int = 8,              #the heads of the multi-head attention
+        n_kv_heads: int = 2,            #the heads of the key-value attention
         vocab_size: int = 25600,        #the vocabulary size
         hidden_dim: int = None,         #the hidden dimension of the MLP
         multiple_of: int = 64,          #
@@ -505,7 +506,22 @@ class Transformer(PreTrainedModel):
         
         self.eos_token_id = args.eos_token_id
         self.pad_token_id = args.pad_token_id
-        
+
+        # gradient checkpointing：默认关闭，可通过 gradient_checkpointing_enable() 打开
+        self.gradient_checkpointing = False
+        self._gc_use_reentrant = False
+
+    def gradient_checkpointing_enable(self, use_reentrant: bool = False):
+        """开启梯度检查点：反向传播时按 TransformerBlock 粒度重算激活以节省显存。
+        use_reentrant=False 是 PyTorch 推荐的新实现，与 DDP/torch.compile 配合更好。
+        """
+        self.gradient_checkpointing = True
+        self._gc_use_reentrant = use_reentrant
+        # 关闭 dropout 的 inplace 等可能干扰重算的设置（这里 dropout 默认就不是 inplace，无需额外处理）
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
     def _init_weights(self, module:nn.Module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0, std=0.02)
@@ -590,13 +606,20 @@ class Transformer(PreTrainedModel):
         x = self.token_embeddings(input_ids)
         x = self.dropout(x)
         
+        freqs_cos = self.freqs_cos[:seq_len, :]
+        freqs_sin = self.freqs_sin[:seq_len, :]
+
+        use_gc = self.gradient_checkpointing and self.training
         for layer in self.layers:
-            x = layer(
-                x, 
-                self.freqs_cos[:seq_len, :],
-                self.freqs_sin[:seq_len, :], 
-                key_padding_mask
-            )
+            if use_gc:
+                # checkpoint 要求传给被包裹函数的 tensor 参与计算图；
+                # freqs_cos/sin 是 buffer 不需梯度，key_padding_mask 也无梯度，
+                # 用闭包打包成 (x,) 作为唯一需要保留计算图的输入。
+                def _layer_forward(x_in, _layer=layer):
+                    return _layer(x_in, freqs_cos, freqs_sin, key_padding_mask)
+                x = checkpoint(_layer_forward, x, use_reentrant=self._gc_use_reentrant)
+            else:
+                x = layer(x, freqs_cos, freqs_sin, key_padding_mask)
     
         x = self.RMSNorm(x)
 
