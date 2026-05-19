@@ -40,8 +40,10 @@
                 {%- set content = content.split('</think>')[-1].lstrip('\n') %}
             {%- endif %}
         {%- endif %}
-        {%- if true %}
+        {%- if reasoning_content %}
             {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content.lstrip('\n') }}
         {%- endif %}
         {%- if message.tool_calls %}
             {%- for tool_call in message.tool_calls %}
@@ -79,7 +81,5 @@
     {{- '<|im_start|>assistant\n' }}
     {%- if open_thinking is defined and open_thinking is true %}
         {{- '<think>\n' }}
-    {%- else %}
-        {{- '<think>\n\n</think>\n\n' }}
     {%- endif %}
 {%- endif %}

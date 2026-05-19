@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch.utils.checkpoint import checkpoint
 
@@ -464,7 +464,7 @@ class TransformerBlock(nn.Module):
         return output
     
     
-class Transformer(PreTrainedModel):
+class Transformer(PreTrainedModel, GenerationMixin):
     config_class = MyModelConfig
     
     def __init__(self, args:MyModelConfig):
@@ -590,7 +590,13 @@ class Transformer(PreTrainedModel):
     def forward(self,
                 input_ids:torch.Tensor,
                 labels:Optional[torch.Tensor] = None,
-                key_padding_mask:Optional[torch.Tensor] = None,
+                attention_mask:Optional[torch.Tensor] = None,
+                position_ids:Optional[torch.Tensor] = None,
+                past_key_values:Optional[list[tuple[torch.Tensor]]]=None,
+                use_cache:bool=False,
+                cache_position=None,
+                return_dict:bool=False,
+                **kwargs,
     ) -> CausalLMOutputWithPast:     
         """
         这个函数是用来执行Transformer模型的前向传播的。
@@ -601,6 +607,7 @@ class Transformer(PreTrainedModel):
         输出：  
         CausalLMOutputWithPast: 包含损失和logits的输出对象。损失是一个标量张量，表示交叉熵损失；logits是一个张量，形状为（batch_size, seq_len, vocab_size），表示每个位置的预测分布。
         """
+        key_padding_mask = attention_mask
         
         _, seq_len = input_ids.shape           
         x = self.token_embeddings(input_ids)
@@ -630,7 +637,12 @@ class Transformer(PreTrainedModel):
             main_loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 labels.view(-1),
-                ignore_index=-100,
+                # ignore_index=-100 意味着在计算交叉熵损失时，标签为 -100 的位置将被忽略，
+                # 不参与损失的计算。这与pad_token_id不同，pad_token_id是用来在计算scores
+                # 时不参与计算的，实际操作为计算scores时把pad位置的logits填一个很大的负数
+                # 使得softmax后概率接近于0；而ignore_index=-100是直接在计算loss时不考虑
+                # 这些位置。
+                ignore_index=-100, 
                 reduction="mean"
             )
             # 汇总所有 MoE 层的负载均衡损失;dense 模型或非训练时为 0 tensor
@@ -647,12 +659,12 @@ class Transformer(PreTrainedModel):
         return CausalLMOutputWithPast(loss, logits)    
         
     @torch.inference_mode()
-    def generate(self,
-                 input_ids:torch.Tensor,
-                 max_new_tokens:int=256,
-                 top_k:int=None,
-                 temperature:float=1.0,
-                 key_padding_mask:Optional[torch.Tensor]=None,
+    def my_generate(self,
+                    input_ids:torch.Tensor,
+                    max_new_tokens:int=256,
+                    top_k:int=None,
+                    temperature:float=1.0,
+                    key_padding_mask:Optional[torch.Tensor]=None,
     ):
         """
         这个函数是用来生成文本的。
@@ -692,7 +704,7 @@ class Transformer(PreTrainedModel):
                 if key_padding_mask is not None:
                     key_padding_mask = key_padding_mask[:, -self.max_seq_len:]
             
-            logits = self(input_ids, key_padding_mask=key_padding_mask).logits[:, -1, :]
+            logits = self(input_ids, attention_mask=key_padding_mask).logits[:, -1, :]
             
             if temperature == 0.0:
                 _, next_tokens = torch.topk(logits, k=1, dim=-1)

@@ -2,12 +2,13 @@ import os
 import argparse
 
 from model import MyModelConfig
-from .ddp_pretrain import (
+from train_utils import (
     set_ddp, destroy_ddp, logger,
     load_tokenizer, load_model,
     build_optimizer, maybe_resume,
-    epoch_train,
+    save_hfckpt,
 )
+from .ddp_pretrain import epoch_train
 from deal_dataset.dataset import PretrainDataset
 
 import swanlab
@@ -184,6 +185,12 @@ if __name__ == "__main__":
             epoch, my_model, data_loader, optimizer, scaler, ctx, lm_config, args,
             start_step=start_step if epoch == start_epoch else 0,
         )
+
+    try:
+        if args.is_main:
+            save_hfckpt(args.save_dir, my_model, tokenizer)
+    finally:
+        dist.barrier()
 
     #销毁ddp环境
     destroy_ddp()
