@@ -5,6 +5,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 from model import Transformer, MyModelConfig
+from train_utils import count_parameters
 
 if __name__ == "__main__":
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,7 +35,7 @@ if __name__ == "__main__":
         my_model = Transformer.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
     my_model.to(device)
 
-    num_params = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
+    num_params = count_parameters(my_model)
     print(f"模型参数量: {num_params / 1e6:.3f}M ({num_params:,})")
     
     prompt = [

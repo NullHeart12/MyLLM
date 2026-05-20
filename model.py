@@ -622,7 +622,7 @@ class Transformer(PreTrainedModel, GenerationMixin):
                 # checkpoint 要求传给被包裹函数的 tensor 参与计算图；
                 # freqs_cos/sin 是 buffer 不需梯度，key_padding_mask 也无梯度，
                 # 用闭包打包成 (x,) 作为唯一需要保留计算图的输入。
-                def _layer_forward(x_in, _layer=layer):
+                def _layer_forward(x_in, _layer=layer):#避免闭包捕获循环变量导致的 late binding 问题
                     return _layer(x_in, freqs_cos, freqs_sin, key_padding_mask)
                 x = checkpoint(_layer_forward, x, use_reentrant=self._gc_use_reentrant)
             else:

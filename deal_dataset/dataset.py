@@ -59,6 +59,10 @@ class SFTDataset(Dataset):
             'labels':    torch.tensor(labels[1:],     dtype=torch.long),
         }
         
+    def get_len(self):
+        self._ensure_loaded()
+        return [len(sample['input_ids']) for sample in self._ds]
+        
 class SFTCollator:
     """
     SFT 数据集的 Collator。将样本列表拼成 batch。

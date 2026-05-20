@@ -1,6 +1,7 @@
 # 数据集目录(几十 GB,不上传 GitHub)
 dataset/
 processed_dataset/
+base_model/
 
 # Python
 __pycache__/
