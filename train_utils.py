@@ -211,14 +211,23 @@ def trans_to_hfckpt(path_from: str, path_to: str, tokenizer_path: str = None):
     """
     assert os.path.isfile(path_from), f"checkpoint 不存在: {path_from}"
 
-    ckpt = torch.load(path_from, map_location="cpu")
+    ckpt = torch.load(path_from, map_location="cpu", weights_only=False)
     assert "model" in ckpt and "config" in ckpt, \
         "checkpoint 缺少 'model' 或 'config' 字段,无法转换"
 
-    lm_config = MyModelConfig(**ckpt["config"])
+    # 提取只需要的两部分到独立变量,然后释放 ckpt（含 optimizer/scaler 等大块内存)
+    # 否则后续构造模型时可能触发 OOM（RAM 紧张的机器上特别明显）。
+    model_state = ckpt["model"]
+    cfg_dict = ckpt["config"]
+    del ckpt
+    import gc; gc.collect()
+
+    lm_config = MyModelConfig(**cfg_dict)
     model = Transformer(lm_config)
 
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    missing, unexpected = model.load_state_dict(model_state, strict=False)
+    del model_state
+    gc.collect()
     if missing:
         logger(f"[warn] 缺失参数: {missing}", force=True)
     if unexpected:
@@ -236,10 +245,9 @@ def trans_to_hfckpt(path_from: str, path_to: str, tokenizer_path: str = None):
 
 
 def save_hfckpt(path: str, model: DDP, tokenizer: PreTrainedTokenizerBase):
-    hf_dir = os.path.join(path, "hf_model")
-    model.module.save_pretrained(hf_dir, safe_serialization=True)
-    tokenizer.save_pretrained(hf_dir)
-    logger(f"HF 格式模型已保存到 {hf_dir}")
+    model.module.save_pretrained(path, safe_serialization=True)
+    tokenizer.save_pretrained(path)
+    logger(f"HF 格式模型已保存到 {path}")
 
 
 def epoch_train(

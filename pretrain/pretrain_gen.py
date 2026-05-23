@@ -12,9 +12,10 @@ if __name__ == "__main__":
     # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     
     parse = argparse.ArgumentParser(description="使用预训练模型进行文本生成")
-    parse.add_argument("--model_path", type=str, 
-                       default=os.path.join(PROJECT_ROOT, "hf_model"), 
-                       help="预训练模型路径")
+    parse.add_argument("--model_path", type=str,
+                       default=os.path.join(PROJECT_ROOT, "base_model", "hf_model_291M"),
+                    #    default=os.path.join(PROJECT_ROOT, "base_model", "hf_model_336M"),
+                       help="预训练模型路径（HF 格式目录，含 config.json + model.safetensors + tokenizer 文件）")
     parse.add_argument("--use_auto", action="store_true", help="是否使用 AutoModelForCausalLM 加载模型")
     parse.add_argument("--use_my_gen", action="store_true", help="是否使用自定义生成函数")
     
@@ -23,7 +24,10 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
         
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        assert False, "当前环境没有可用的 GPU，无法进行生成测试。请在支持 CUDA 的环境中运行此脚本。"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
@@ -37,19 +41,27 @@ if __name__ == "__main__":
 
     num_params = count_parameters(my_model)
     print(f"模型参数量: {num_params / 1e6:.3f}M ({num_params:,})")
-    
+
+    # 打印模型配置
+    cfg = my_model.config
+    print("=" * 60)
+    print("模型配置:")
+    for k, v in sorted(cfg.to_dict().items()):
+        print(f"  {k:30s} = {v}")
+    print("=" * 60)
+
     prompt = [
-        "合肥工业大学是",
-        "中国科学院是",
-        "中国科学院计算技术研究所位于北京市中关村，该研究所为中国",
-        "人工智能是计算机科学的一个分支，它企图了解智能的实质，并生产出一种新的能以人类智能相似的方式做出",
-        "卧槽，尼玛，这是",
-        "I am very happy to be",
-        "When I was",
-        "Oh motherfuker,shit bitch",
-        "Based on the comparative expression of the single-copy",
-        "Large language models (LLMs) are a type of artificial intelligence (AI) trained on vast",
-        "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, "
+        # "合肥工业大学是",
+        # "中国科学院是",
+        # "中国科学院计算技术研究所位于北京市中关村，该研究所为中国",
+        # "人工智能是计算机科学的一个分支，它企图了解智能的实质，并生产出一种新的能以人类智能相似的方式做出",
+        # "卧槽，尼玛，这是",
+        # "I am very happy to be",
+        # "When I was",
+        # "Oh motherfuker,shit bitch",
+        # "Based on the comparative expression of the single-copy",
+        # "Large language models (LLMs) are a type of artificial intelligence (AI) trained on vast",
+        # "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, "
     ]
     
     tokenizer.padding_side = "left"

@@ -11,7 +11,6 @@ from torch.utils.checkpoint import checkpoint
 
 class MyModelConfig(PretrainedConfig):
     model_type = "my_model"
-
     def __init__(
         self,
         dim: int = 1024,                #the dimension of the model
@@ -29,11 +28,24 @@ class MyModelConfig(PretrainedConfig):
         max_seq_len: int = 1024,        #the maximum sequence length
         dropout: float = 0.0,           #the dropout rate
         flash_attention: bool = False,  #whether to use flash attention
-        bos_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
+        bos_token_id: Optional[int] = 1,
+        eos_token_id: Optional[int] = 2,
+        pad_token_id: Optional[int] = 0,
+        tie_word_embeddings: bool = True,   # 让 transformers 知道 output.weight 与 token_embeddings.weight 是绑定的
         **kwargs
-    ):
+    ):   
+        # PretrainedConfig 的初始化：会写入 transformers_version、torch_dtype 等内部字段，
+        # 并把 bos/eos/pad 和 tie_word_embeddings 注册到 self 上。
+        # tie_word_embeddings=True：让 transformers 在 save/load 时把 output.weight 视作
+        # token_embeddings.weight 的 tied 副本。
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )        
+        
         self.dim = dim
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -88,14 +100,9 @@ class MyModelConfig(PretrainedConfig):
                 f"moe_top_k ({self.moe_top_k}) must be in [1, n_experts={self.n_experts}]"
             assert self.router_aux_loss_coef >= 0, "router_aux_loss_coef must be non-negative"
 
-        # ---- 特殊 token ----
-        assert bos_token_id is not None, "bos_token_id must be specified"
-        assert eos_token_id is not None, "eos_token_id must be specified"
-        assert pad_token_id is not None, "pad_token_id must be specified"
 
-        super().__init__(**kwargs)
-        
-        
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -466,6 +473,10 @@ class TransformerBlock(nn.Module):
     
 class Transformer(PreTrainedModel, GenerationMixin):
     config_class = MyModelConfig
+    # token_embeddings.weight 与 output.weight 在 __init__ 里被绑成同一个 tensor，
+    # 告知 transformers：output.weight 是 tied 到 token_embeddings.weight 的，
+    # save_pretrained 时不会把 output.weight 当独立权重保存。
+    _tied_weights_keys = {"output.weight": "token_embeddings.weight"}
     
     def __init__(self, args:MyModelConfig):
         super().__init__(args)
@@ -510,6 +521,11 @@ class Transformer(PreTrainedModel, GenerationMixin):
         # gradient checkpointing：默认关闭，可通过 gradient_checkpointing_enable() 打开
         self.gradient_checkpointing = False
         self._gc_use_reentrant = False
+
+        # transformers 5.x 要求 PreTrainedModel 子类在 __init__ 末尾调用 post_init()，
+        # 其中会根据 _tied_weights_keys 注册 self.all_tied_weights_keys，
+        # 否则 from_pretrained 加载时会 AttributeError。
+        self.post_init()
 
     def gradient_checkpointing_enable(self, use_reentrant: bool = False):
         """开启梯度检查点：反向传播时按 TransformerBlock 粒度重算激活以节省显存。

@@ -8,7 +8,7 @@ from train_utils import (
     set_ddp, destroy_ddp, logger,
     load_tokenizer, load_model,
     build_optimizer, maybe_resume, save_hfckpt,
-    epoch_train,
+    epoch_train, count_parameters
 )
 from deal_dataset.dataset import SFTDataset, SFTCollator
 
@@ -172,7 +172,8 @@ if __name__=="__main__":
 
     try:
         if args.is_main:
-            save_hfckpt(args.save_dir, my_model, tokenizer)
+            save_hfckpt(os.path.join(args.save_dir, f"hf_model_{count_parameters(my_model)}"),
+                        my_model, tokenizer)
     finally:
         dist.barrier()
 
