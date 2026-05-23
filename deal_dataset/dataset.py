@@ -1,7 +1,10 @@
+import os
+
+import pyarrow.compute as pc
+
 import torch
 from torch.utils.data import Dataset
-from datasets import load_dataset
-
+from datasets import load_dataset, load_from_disk
 
 class PretrainDataset(Dataset):
     """
@@ -16,7 +19,12 @@ class PretrainDataset(Dataset):
 
     def _ensure_loaded(self):
         if self._ds is None:
-            self._ds = load_dataset('json', data_files=self.data_path, split='train')
+            # 自动识别：目录走 load_from_disk（Arrow，秒级加载）；
+            # 单文件走 load_dataset('json',...)（兼容老的 .jsonl 路径）。
+            if os.path.isdir(self.data_path):
+                self._ds = load_from_disk(self.data_path)
+            else:
+                self._ds = load_dataset('json', data_files=self.data_path, split='train')
 
     def __len__(self):
         self._ensure_loaded()
@@ -43,7 +51,12 @@ class SFTDataset(Dataset):
 
     def _ensure_loaded(self):
         if self._ds is None:
-            self._ds = load_dataset('json', data_files=self.data_path, split='train')
+            # 自动识别：目录走 load_from_disk（Arrow 格式，秒级加载）；
+            # 单文件走 load_dataset('json',...)（兼容老的 _tokenized.jsonl 路径）。
+            if os.path.isdir(self.data_path):
+                self._ds = load_from_disk(self.data_path)
+            else:
+                self._ds = load_dataset('json', data_files=self.data_path, split='train')
 
     def __len__(self):
         self._ensure_loaded()
@@ -59,9 +72,16 @@ class SFTDataset(Dataset):
             'labels':    torch.tensor(labels[1:],     dtype=torch.long),
         }
         
-    def get_len(self):
+    def get_len(self) -> list[int]:
+        """返回所有样本的 input_ids 长度，给 LengthGroupedSampler 用。
+
+        用 pyarrow.compute 在 C++ 层向量化算 ListArray 的长度，
+        避免逐条 Python 反序列化（3.5M 样本能从几分钟降到 < 1 秒）。
+        combine_chunks() 是零拷贝，把多个 chunk 合成单个 Array 方便 pc.list_value_length。
+        """
         self._ensure_loaded()
-        return [len(sample['input_ids']) for sample in self._ds]
+        col = self._ds.data['input_ids'].combine_chunks()
+        return pc.list_value_length(col).to_pylist()
         
 class SFTCollator:
     """

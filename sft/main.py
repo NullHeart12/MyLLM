@@ -49,8 +49,10 @@ if __name__=="__main__":
     parser.add_argument("--use_swanlab", action="store_true", help="是否使用SwanLab进行实验跟踪")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载的工作进程数")
     parser.add_argument("--data_path", type=str, 
+                        # default=os.path.join(PROJECT_ROOT, "processed_dataset", 
+                                            #  "BelleGroup_sft.jsonl"), 
                         default=os.path.join(PROJECT_ROOT, "processed_dataset", 
-                                             "BelleGroup_sft.jsonl"), 
+                                             "BelleGroup_sft_tokenized_arrow"), 
                         help="训练数据路径")
 
     # 训练优化参数
