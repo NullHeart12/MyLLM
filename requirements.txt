@@ -7,3 +7,4 @@ swanlab
 modelscope
 huggingface_hub
 tqdm
+bitsandbytes
