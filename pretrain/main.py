@@ -20,14 +20,14 @@ from torch import amp
 from torch.utils import data
 
 if __name__ == "__main__":
-    # PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
     
     parser = argparse.ArgumentParser(description="using DDP Pretrain MyLLM")
     
     # 基础训练参数
     parser.add_argument("--out_dir", type=str, 
-                        default=os.path.join(PROJECT_ROOT, "base_model"), 
+                        default=os.path.join(PROJECT_ROOT, "model", "base_model"), 
                         help="模型输出目录")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32,
@@ -87,7 +87,7 @@ if __name__ == "__main__":
     # 断点续训
     parser.add_argument("--resume", type=str,
                         default=None,
-                        # default=os.path.join(PROJECT_ROOT, "base_model", "pretrain_param_count82.595M.pt"),
+                        # default=os.path.join(PROJECT_ROOT, "model", "base_model", "pretrain_param_count82.595M.pt"),
                         help="从指定 checkpoint 路径恢复训练")
 
     args = parser.parse_args()

@@ -261,13 +261,18 @@ def epoch_train(
                 args: argparse.Namespace,
                 start_step: int = 0,
                 ckpt_prefix: str = "ckpt",
+                save_fn=None,
     ):
-    """单 epoch 训练循环，pretrain / SFT / DPO 共用。
+    """单 epoch 训练循环，pretrain / SFT / DPO / LoRA 共用。
 
-    与具体阶段相关的两点已参数化：
-      - ckpt_prefix：保存的 .pt 文件名前缀（pretrain 用 "pretrain"，SFT 用 "sft"，等等）；
-      - batch 里的 attention_mask 可选（SFT 变长 collator 会带，pretrain 等长不需要）。
+    与具体阶段相关的几点已参数化：
+      - ckpt_prefix：保存的 .pt 文件名前缀（pretrain 用 "pretrain"，SFT 用 "sft"，LoRA 用 "lora" 等）；
+      - batch 里的 attention_mask 可选（SFT 变长 collator 会带，pretrain 等长不需要）；
+      - save_fn：保存函数。None 时走默认 save_checkpoint（保存完整模型权重）；
+        传入自定义函数（如 save_lora_checkpoint）则只保存对应内容。签名必须为
+        save_fn(path, model, optimizer, scaler, lm_config, epoch, step, global_step)。
     """
+    _save_fn = save_fn if save_fn is not None else save_checkpoint
     all_steps = len(data_loader)
     start_time = None  # 在跳过 resume 之前的步骤后再启动计时
 
@@ -348,11 +353,19 @@ def epoch_train(
 
         if (step + 1) % args.save_interval == 0 and args.is_main:
             model.eval()
-            save_path = os.path.join(
+            # LoRA(save_fn=save_lora_checkpoint)用 epoch/step 命名,语义清晰;
+            # 全参(默认 save_checkpoint)沿用参数量命名,保持向后兼容
+            if save_fn is not None:
+                save_path = os.path.join(
+                    args.save_dir,
+                    f"{ckpt_prefix}_epoch{epoch+1}_step{step+1}.pt"
+                )
+            else:
+                save_path = os.path.join(
                     args.save_dir,
                     f"{ckpt_prefix}_param_count{count_parameters(model) / 1e6:.3f}M.pt"
                 )
-            save_checkpoint(
+            _save_fn(
                 save_path, model, optimizer, scaler, lm_config,
                 epoch=epoch, step=step + 1,
                 global_step=step + 1 + epoch * all_steps,
@@ -364,11 +377,17 @@ def epoch_train(
             model.eval()
             snap_dir = os.path.join(args.save_dir, f"snapshot_{epoch}")
             os.makedirs(snap_dir, exist_ok=True)
-            save_path = os.path.join(
+            if save_fn is not None:
+                save_path = os.path.join(
+                    snap_dir,
+                    f"snapshot_{ckpt_prefix}_step{step+1}.pt"
+                )
+            else:
+                save_path = os.path.join(
                     snap_dir,
                     f"snapshot_step{step + 1}_param_count{count_parameters(model) / 1e6:.3f}M.pt"
                 )
-            save_checkpoint(
+            _save_fn(
                 save_path, model, optimizer, scaler, lm_config,
                 epoch=epoch, step=step + 1,
                 global_step=step + 1 + epoch * all_steps,

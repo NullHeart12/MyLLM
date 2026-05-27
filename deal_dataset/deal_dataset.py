@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 
@@ -6,17 +7,79 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 
 
-# SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+# PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
 
-read_pretrain_data   = os.path.join(PROJECT_ROOT, 'dataset', 'mobvoi_seq_monkey_general_open_corpus.jsonl')
+read_pretrain_data   = os.path.join(
+    PROJECT_ROOT, 
+    'dataset', 
+    'seq_monkey',
+    'mobvoi_seq_monkey_general_open_corpus.jsonl'
+)
 # 改用 Arrow 目录（save_to_disk 创建的是目录而非单文件）
 output_pretrain_data = os.path.join(PROJECT_ROOT, 'processed_dataset', 'seq_monkey_arrow')
 read_sft_data        = os.path.join(PROJECT_ROOT, 'dataset', 'BelleGroup', 'train_3.5M_CN.json')
 output_sft_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'BelleGroup_sft.jsonl')
 
-TOKENIZER_DIR = os.path.join(PROJECT_ROOT, 'tokenizer_k')
+# 古诗词 CSV → jsonl 中转产物;jsonl 之后再直接喂 PretrainProcessor
+read_poetry_csv      = os.path.join(PROJECT_ROOT, 'dataset', 'poetry', 'train.csv')
+output_poetry_jsonl  = os.path.join(PROJECT_ROOT, 'dataset', 'poetry', 'poetry.jsonl')
+output_poetry_arrow  = os.path.join(PROJECT_ROOT, 'processed_dataset', 'poetry_arrow')
+
+TOKENIZER_DIR_OR_NAME = os.path.join(PROJECT_ROOT, 'tokenizer_k')
+
+
+class PoetryCSVConverter:
+    """把古诗词 CSV 转成 PretrainProcessor 可读的 jsonl。
+
+    输入约定:
+      - CSV 第一行为表头(如 `text1`),会被跳过
+      - 后续每行只有一列,内容是一首古诗词纯文本
+      - 编码 utf-8(带不带 BOM 都行,utf-8-sig 自动剥)
+
+    输出:每行 {"text": "..."} 的 jsonl。这个文件可以直接作为
+    PretrainProcessor(input_path=...) 的输入。
+
+    设计上故意不做 tokenize:packing / chunking 全部交给 PretrainProcessor,
+    保持职责单一,后续要换 tokenizer 不用重跑这一步。
+    """
+
+    DEFAULT_MIN_LENGTH = 4   # 太短的当噪音丢弃(空行、只有标点等)
+
+    def __init__(self,
+                 input_path: str = read_poetry_csv,
+                 output_path: str = output_poetry_jsonl,
+                 min_length: int = DEFAULT_MIN_LENGTH):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.min_length = min_length
+
+    def run(self):
+        if os.path.exists(self.output_path):
+            print(f"Skip poetry: {self.output_path} already exists")
+            return
+        os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
+
+        n_kept, n_skipped = 0, 0
+        # utf-8-sig 自动剥离 BOM;newline='' 让 csv 模块自己处理 \r\n,
+        # 避免 Windows 行尾在跨平台时错位
+        with open(self.input_path, 'r', encoding='utf-8-sig', newline='') as f_in, \
+             open(self.output_path, 'w', encoding='utf-8') as f_out:
+            reader = csv.reader(f_in)
+            next(reader, None)  # 丢掉表头(如 'text1')
+            for row in reader:
+                if not row:
+                    n_skipped += 1
+                    continue
+                text = row[0].strip()
+                if len(text) < self.min_length:
+                    n_skipped += 1
+                    continue
+                f_out.write(json.dumps({"text": text}, ensure_ascii=False) + '\n')
+                n_kept += 1
+        print(f"Poetry CSV -> jsonl done: kept={n_kept}, skipped={n_skipped}")
+        print(f"Output: {self.output_path}")
 
 
 class PretrainProcessor:
@@ -43,14 +106,14 @@ class PretrainProcessor:
     def __init__(self,
                  input_path: str = read_pretrain_data,
                  output_path: str = output_pretrain_data,
-                 tokenizer_dir: str = TOKENIZER_DIR,
+                 tokenizer_dir_or_name: str = TOKENIZER_DIR_OR_NAME,
                  chunk_size: int = DEFAULT_CHUNK_SIZE,
                  batch_size: int = DEFAULT_BATCH_SIZE,
                  group_batch: int = DEFAULT_GROUP_BATCH,
                  num_proc: int = DEFAULT_NUM_PROC):
         self.input_path = input_path
         self.output_path = output_path   # Arrow 目录
-        self.tokenizer_dir = tokenizer_dir
+        self.tokenizer_dir_or_name = tokenizer_dir_or_name
         self.chunk_size = chunk_size
         self.batch_size = batch_size
         self.group_batch = group_batch
@@ -62,13 +125,9 @@ class PretrainProcessor:
             print(f"Skip pretrain: {self.output_path} already exists")
             return
 
-        if not os.path.exists(self.tokenizer_dir):
-            raise FileNotFoundError(
-                f"Tokenizer not found at {self.tokenizer_dir}. "
-                "Please run train_tokenizer.py first."
-            )
-
-        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir)
+        # tokenizer_dir_or_name 既可以是本地路径,也可以是 HF Hub 名字(如 "Qwen/Qwen2.5-32B"),
+        # 因此不再用 os.path.exists 检查;让 from_pretrained 自己报错即可。
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir_or_name)
         eos_id = tokenizer.eos_token_id
         chunk_size = self.chunk_size      # 闭包捕获本地变量，避免每条都查 self 属性
 
@@ -131,12 +190,12 @@ class SFTProcessor:
     def __init__(self,
                  input_path: str = read_sft_data,
                  output_path: str = output_sft_data,
-                 tokenizer_dir: str = TOKENIZER_DIR,
+                 tokenizer_dir_or_name: str = TOKENIZER_DIR_OR_NAME,
                  system_prompt: str = DEFAULT_SYSTEM_PROMPT,
                  max_len: int = DEFAULT_MAX_LEN):
         self.input_path = input_path
         self.output_path = output_path
-        self.tokenizer_dir = tokenizer_dir
+        self.tokenizer_dir_or_name = tokenizer_dir_or_name
         self.system_prompt = system_prompt
         self.max_len = max_len
         # 阶段 2 的输出路径：Arrow 目录（save_to_disk 创建的是目录而非单文件），
@@ -182,7 +241,7 @@ class SFTProcessor:
                 f"Messages file {self.output_path} 不存在，先运行 _convert_file()。"
             )
             
-        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir)
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir_or_name)
         ds = load_dataset('json', data_files=self.output_path, split='train')
         max_len = self.max_len   # 闭包捕获本地变量，避免每条都查 self 属性
 
@@ -281,14 +340,27 @@ class SFTProcessor:
         self._tokenize_file()
 
 
+
 if __name__ == "__main__":
     # PretrainProcessor(
     #     input_path=read_pretrain_data,
     #     output_path=output_pretrain_data,
-    #     tokenizer_dir=TOKENIZER_DIR,
+    #     tokenizer_dir_or_name=TOKENIZER_DIR_OR_NAME,
     # ).run()
 
-    SFTProcessor(
-        input_path=read_sft_data,
-        output_path=output_sft_data,
+    # SFTProcessor(
+    #     input_path=read_sft_data,
+    #     output_path=output_sft_data,
+    # ).run()
+
+    # 古诗词:CSV → jsonl → tokenize 成 arrow,直接给 PretrainDataset 用
+    PoetryCSVConverter(
+        input_path=read_poetry_csv,
+        output_path=output_poetry_jsonl,
+    ).run()
+    PretrainProcessor(
+        input_path=output_poetry_jsonl,
+        output_path=output_poetry_arrow,
+        tokenizer_dir_or_name="Qwen/Qwen3.5-27B",   # 想用本地路径也行
+        chunk_size=512,
     ).run()

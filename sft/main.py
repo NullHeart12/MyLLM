@@ -33,10 +33,10 @@ if __name__=="__main__":
     parser.add_argument("--use_auto", action="store_true", 
                         help="是否使用 HuggingFace AutoModelForCausalLM")
     parser.add_argument("--load_dir", type=str, 
-                        default=os.path.join(PROJECT_ROOT, "base_model", "hf_model"),
+                        default=os.path.join(PROJECT_ROOT, "model", "base_model", "hf_model"),
                         help="预训练模型加载目录")
     parser.add_argument("--out_dir", type=str, 
-                        default=os.path.join(PROJECT_ROOT, "sft_model"), 
+                        default=os.path.join(PROJECT_ROOT, "model", "sft_model"), 
                         help="模型输出目录")
     
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
