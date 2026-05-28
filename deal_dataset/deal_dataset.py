@@ -361,6 +361,6 @@ if __name__ == "__main__":
     PretrainProcessor(
         input_path=output_poetry_jsonl,
         output_path=output_poetry_arrow,
-        tokenizer_dir_or_name="Qwen/Qwen3.5-27B",   # 想用本地路径也行
+        tokenizer_dir_or_name="Qwen/Qwen3.6-27B",   # 想用本地路径也行
         chunk_size=512,
     ).run()

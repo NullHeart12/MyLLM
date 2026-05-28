@@ -8,3 +8,7 @@ modelscope
 huggingface_hub
 tqdm
 bitsandbytes
+peft
+accelerate
+numpy               # 代码直接 import,torch 装时已带,显式声明更稳
+pyarrow             # deal_dataset 用了 pyarrow.compute,datasets 装时已带

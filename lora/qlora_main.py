@@ -9,7 +9,7 @@ from train_utils import (
     epoch_train, count_parameters
 )
 from deal_dataset.dataset import PretrainDataset
-from model_lora import (
+from .model_lora import (
     apply_lora, save_lora, load_lora,
     save_lora_checkpoint, load_lora_checkpoint,
 )
@@ -20,6 +20,12 @@ import torch.distributed as dist
 from torch import amp
 from torch.utils import data
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,             # 把一个 module 包成"自动 GC 的 module"
+    CheckpointImpl,                 # NO_REENTRANT / REENTRANT 二选一
+    apply_activation_checkpointing, # 批量替换:扫遍模型,符合条件的 module 整个换成 wrapped 版
+)
+from functools import partial
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -27,6 +33,7 @@ from transformers import (
 )
 from peft import prepare_model_for_kbit_training
 import bitsandbytes as bnb
+
 
 if __name__=="__main__":
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +53,6 @@ if __name__=="__main__":
     parser.add_argument("--batch_size", type=int, default=1, 
                         help="每张卡的批次大小（DDP 约定）。全局有效 batch = batch_size × world_size × gradient_accumulation_steps")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型: float16 / bfloat16 / float32")
 
     # 实验跟踪和数据加载参数
     parser.add_argument("--use_swanlab", action="store_true", help="是否使用SwanLab进行实验跟踪")
@@ -138,7 +144,7 @@ if __name__=="__main__":
     )
     model = prepare_model_for_kbit_training(
         model, 
-        use_gradient_checkpointing=args.gradient_checkpointing
+        use_gradient_checkpointing=False,
     )
     apply_lora(
         model,
@@ -150,13 +156,27 @@ if __name__=="__main__":
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
     )
-
+    
     # 训练参数量打印(只数可训练的 LoRA 参数)
     if args.is_main:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total     = count_parameters(model)
+        total     = sum(p.numel() for p in model.parameters())
         logger(f"可训练参数: {trainable/1e6:.3f}M / 总参数: {total/1e6:.3f}M "
                f"(占比 {100*trainable/total:.4f}%)")
+
+    if args.gradient_checkpointing:
+        DecoderLayerCls = type(model.model.layers[0])
+        
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,   
+            ),
+            check_fn=lambda m: isinstance(m, DecoderLayerCls),
+        )
+        if args.is_main:
+            logger(f"已对 {DecoderLayerCls.__name__} 手动套 activation checkpointing")
 
     # DDP 包装 —— 量化 base 参数 requires_grad=False,DDP 默认只同步 trainable(LoRA)。
     # find_unused_parameters=False:LoRA 层每步都走到,不会有 unused 参数。

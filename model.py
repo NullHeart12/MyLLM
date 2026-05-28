@@ -228,6 +228,27 @@ class Attention(nn.Module):
         self.Wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.Wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.Wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+        
+        self.register_buffer(
+            "chache_k",
+            torch.zeros(                
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_kv_heads,
+                self.head_dim
+            ),
+            persistent=False
+        )
+        self.register_buffer(
+            "chache_v",
+            torch.zeros(                
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_kv_heads,
+                self.head_dim
+            ),
+            persistent=False
+        )
 
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
@@ -238,6 +259,7 @@ class Attention(nn.Module):
                 X: torch.Tensor,
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
+                start_pos: int,
                 key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
