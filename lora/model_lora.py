@@ -4,6 +4,14 @@ import os
 import torch
 from torch import nn
 
+def _clean_module_name(name: str) -> str:
+    """去掉 activation checkpointing / FSDP / DDP 等包装在 module 路径里塞的前缀。
+    训练时若用了 apply_activation_checkpointing,层名会变成
+    'model.layers.0._checkpoint_wrapped_module.self_attn.q_proj',
+    eval 时模型没包装,查不到这个 key,所以 save/load 两端都 strip 掉。
+    """
+    return name.replace("._checkpoint_wrapped_module", "").replace("_fsdp_wrapped_module.", "")
+
 class LoRALinear(nn.Module):
     def __init__(self,
                  base: nn.Linear,
@@ -77,12 +85,13 @@ def save_lora(model: nn.Module, path: str):
     meta = {"targets": set(), "rank": None, "alpha": None, "dropout": None}
     for name, module in raw_model.named_modules():
         if isinstance(module, LoRALinear):
-            weights[name] = {
+            clean = _clean_module_name(name)  # 去掉 GC / FSDP 包装前缀,文件干净
+            weights[clean] = {
                 'lora_A': module.lora_A.cpu(),
                 'lora_B': module.lora_B.cpu(),
             }
             # 取模块名最后一段作为后缀,如 "layers.0.attention.Wq" -> "Wq"
-            meta["targets"].add(name.rsplit(".", 1)[-1])
+            meta["targets"].add(clean.rsplit(".", 1)[-1])
             # 假设全模型所有 LoRA 用同一套超参(常见做法)
             meta["rank"] = module.rank
             meta["alpha"] = module.alpha
@@ -108,10 +117,13 @@ def load_lora(model: nn.Module, path: str):
             dropout=meta["dropout"],
         )
 
-    modules = dict(raw_model.named_modules())
+    # 当前模型的 name 也 strip,保证和 ckpt 的 clean key 能对齐
+    # (即使加载到带 GC 包装的训练模型上也兼容)
+    modules = {_clean_module_name(n): m for n, m in raw_model.named_modules()}
     for name, state in weights.items():
-        module = modules[name]
-        if not isinstance(module, LoRALinear):
+        clean = _clean_module_name(name)  # 兼容老 ckpt(保存时未 strip)
+        module = modules.get(clean)
+        if module is None or not isinstance(module, LoRALinear):
             raise RuntimeError(
                 f"模块 {name} 不是 LoRALinear,ckpt 与当前模型结构不匹配"
             )
@@ -133,11 +145,12 @@ def save_lora_checkpoint(path, model, optimizer, scaler, lm_config,
     meta = {"targets": set(), "rank": None, "alpha": None, "dropout": None}
     for name, module in raw_model.named_modules():
         if isinstance(module, LoRALinear):
-            weights[name] = {
+            clean = _clean_module_name(name)
+            weights[clean] = {
                 'lora_A': module.lora_A.cpu(),
                 'lora_B': module.lora_B.cpu(),
             }
-            meta["targets"].add(name.rsplit(".", 1)[-1])
+            meta["targets"].add(clean.rsplit(".", 1)[-1])
             meta["rank"] = module.rank
             meta["alpha"] = module.alpha
             meta["dropout"] = module.dropout
@@ -168,11 +181,12 @@ def load_lora_checkpoint(model, optimizer, scaler, args, ckpt=None):
         ckpt = torch.load(args.resume, map_location="cpu")
 
     raw_model = getattr(getattr(model, "_orig_mod", model), "module", model)
-    modules = dict(raw_model.named_modules())
+    modules = {_clean_module_name(n): m for n, m in raw_model.named_modules()}
 
     # 灌 LoRA 权重
     for name, state in ckpt["weights"].items():
-        m = modules.get(name)
+        clean = _clean_module_name(name)  # 兼容老 ckpt
+        m = modules.get(clean)
         if m is None or not isinstance(m, LoRALinear):
             raise RuntimeError(
                 f"模块 {name} 不是 LoRALinear,ckpt 与当前模型结构不匹配"

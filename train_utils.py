@@ -16,6 +16,7 @@ from transformers import (
     PreTrainedTokenizerBase
 )
 import swanlab
+import mlflow
 
 from model import MyModelConfig, Transformer
 
@@ -310,6 +311,7 @@ def epoch_train(
                     input_ids=input_ids,
                     labels=labels,
                     attention_mask=attention_mask,
+                    use_cache=False,
                 )
                 loss = outputs.loss / args.gradient_accumulation_steps
             scaler.scale(loss).backward()
@@ -349,6 +351,12 @@ def epoch_train(
                     swanlab.log({
                         "train/loss": display_loss,
                         "train/lr": optimizer.param_groups[-1]['lr']
+                    }, step=step + epoch * all_steps)
+
+                if getattr(args, "use_mlflow", False):
+                    mlflow.log_metrics({
+                        "train/loss": display_loss,
+                        "train/lr":   optimizer.param_groups[-1]['lr'],
                     }, step=step + epoch * all_steps)
 
         if (step + 1) % args.save_interval == 0 and args.is_main:

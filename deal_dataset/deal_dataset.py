@@ -1,10 +1,13 @@
 import csv
+import glob
 import json
 import os
 
 import tqdm
 from transformers import AutoTokenizer
 from datasets import load_dataset
+import mlflow
+from opencc import OpenCC
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12,8 +15,8 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 # PROJECT_ROOT = "/root/autodl-tmp/MyLLMDataset"
 
 read_pretrain_data   = os.path.join(
-    PROJECT_ROOT, 
-    'dataset', 
+    PROJECT_ROOT,
+    'dataset',
     'seq_monkey',
     'mobvoi_seq_monkey_general_open_corpus.jsonl'
 )
@@ -22,64 +25,126 @@ output_pretrain_data = os.path.join(PROJECT_ROOT, 'processed_dataset', 'seq_monk
 read_sft_data        = os.path.join(PROJECT_ROOT, 'dataset', 'BelleGroup', 'train_3.5M_CN.json')
 output_sft_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'BelleGroup_sft.jsonl')
 
-# 古诗词 CSV → jsonl 中转产物;jsonl 之后再直接喂 PretrainProcessor
-read_poetry_csv      = os.path.join(PROJECT_ROOT, 'dataset', 'poetry', 'train.csv')
-output_poetry_jsonl  = os.path.join(PROJECT_ROOT, 'dataset', 'poetry', 'poetry.jsonl')
-output_poetry_arrow  = os.path.join(PROJECT_ROOT, 'processed_dataset', 'poetry_arrow')
+# chinese-poetry GitHub 仓库原始 JSON 目录(放唐诗 + 宋词的 .json 文件)
+read_chinese_poetry_dir      = os.path.join(PROJECT_ROOT, 'dataset', 'chinese_poetry')
+# converter 输出的 jsonl(中转产物,给 PretrainProcessor 读)
+output_chinese_poetry_jsonl  = os.path.join(PROJECT_ROOT, 'dataset', 'chinese_poetry', 'all.jsonl')
+# tokenize + packing 后的 arrow(训练时给 PretrainDataset 读)
+output_chinese_poetry_arrow  = os.path.join(PROJECT_ROOT, 'processed_dataset', 'chinese_poetry_arrow')
 
 TOKENIZER_DIR_OR_NAME = os.path.join(PROJECT_ROOT, 'tokenizer_k')
 
 
-class PoetryCSVConverter:
-    """把古诗词 CSV 转成 PretrainProcessor 可读的 jsonl。
+class ChinesePoetryConverter:
+    """把 chinese-poetry GitHub 仓库的唐诗 + 宋词 JSON 合并成 jsonl,带朝代/作者/题目 metadata。
 
-    输入约定:
-      - CSV 第一行为表头(如 `text1`),会被跳过
-      - 后续每行只有一列,内容是一首古诗词纯文本
-      - 编码 utf-8(带不带 BOM 都行,utf-8-sig 自动剥)
+    文件命名约定(放在 input_dir 下):
+      唐诗: poet.tang.0.json, poet.tang.1000.json, ..., poet.tang.57000.json
+      宋词: ci.song.0.json,   ci.song.1000.json,   ..., ci.song.21000.json
 
-    输出:每行 {"text": "..."} 的 jsonl。这个文件可以直接作为
-    PretrainProcessor(input_path=...) 的输入。
+    每条 JSON 记录格式:
+      唐诗: {"author": ..., "title": ...,    "paragraphs": [...]}
+      宋词: {"author": ..., "rhythmic": ..., "paragraphs": [...]}   # 词牌名当 title
 
-    设计上故意不做 tokenize:packing / chunking 全部交给 PretrainProcessor,
-    保持职责单一,后续要换 tokenizer 不用重跑这一步。
+    输出 jsonl 每行格式(方案 A:自然语言拼接,适合 continued pretraining):
+      {"text": "唐 · 李白《静夜思》:床前明月光,疑是地上霜。举头望明月,低头思故乡。"}
+      {"text": "宋 · 苏轼《水调歌头》:明月几时有,把酒问青天。..."}
+
+    繁体字处理(默认不转,详见 simplify_traditional 参数):
+      《全唐诗》《全宋诗》原数据是繁体,这是出于保留语义的考虑 ——
+      简体把多个繁体字合并成一个(如 後/后 → 后,髮/發 → 发,乾/幹 → 干),
+      在古典诗词里这种合并会改变字义,作者也明确警告 "转换后的字不符合上下文"。
+      默认 simplify_traditional=False,保留繁体;Qwen tokenizer 能正常处理繁体。
+      非要转的话(如报告输出统一性),传 simplify_traditional=True,需先 pip install opencc-python-reimplemented。
     """
 
-    DEFAULT_MIN_LENGTH = 4   # 太短的当噪音丢弃(空行、只有标点等)
+    DEFAULT_MIN_LENGTH = 10   # 拼接后短于此长度的丢弃(基本是脏数据)
 
     def __init__(self,
-                 input_path: str = read_poetry_csv,
-                 output_path: str = output_poetry_jsonl,
+                 input_dir: str = read_chinese_poetry_dir,
+                 output_path: str = output_chinese_poetry_jsonl,
+                 include_tang: bool = True,
+                 include_song: bool = True,
+                 simplify_traditional: bool = False,
                  min_length: int = DEFAULT_MIN_LENGTH):
-        self.input_path = input_path
+        self.input_dir = input_dir
         self.output_path = output_path
+        self.include_tang = include_tang
+        self.include_song = include_song
         self.min_length = min_length
 
-    def run(self):
-        if os.path.exists(self.output_path):
-            print(f"Skip poetry: {self.output_path} already exists")
-            return
-        os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
+        # 繁→简 转换器,缺包则降级为不转
+        self._cc = None
+        if simplify_traditional:
+            try:
+                self._cc = OpenCC('t2s')   # traditional → simplified
+            except ImportError:
+                print("⚠️ 未装 opencc,繁体字将原样保留。"
+                      "建议: pip install opencc-python-reimplemented")
 
+    def _maybe_simplify(self, text: str) -> str:
+        return self._cc.convert(text) if self._cc else text
+
+    def _format_record(self, rec: dict, dynasty: str, title_key: str) -> str | None:
+        """通用格式化:'朝代 · 作者《题目》:正文'。任一字段缺失返回 None。"""
+        author = (rec.get('author') or '').strip()
+        title = (rec.get(title_key) or '').strip()
+        paragraphs = rec.get('paragraphs') or []
+        if not author or not title or not paragraphs:
+            return None
+        body = "".join(paragraphs)
+        return self._maybe_simplify(f"{dynasty} · {author}《{title}》:{body}")
+
+    def _process_files(self, glob_pattern: str, dynasty: str, title_key: str, f_out) -> tuple[int, int]:
+        """处理一组同朝代的文件,流式写入 f_out,返回 (n_kept, n_skipped)。"""
+        files = sorted(glob.glob(os.path.join(self.input_dir, glob_pattern)))
+        print(f"  {dynasty}: {len(files)} 个文件")
         n_kept, n_skipped = 0, 0
-        # utf-8-sig 自动剥离 BOM;newline='' 让 csv 模块自己处理 \r\n,
-        # 避免 Windows 行尾在跨平台时错位
-        with open(self.input_path, 'r', encoding='utf-8-sig', newline='') as f_in, \
-             open(self.output_path, 'w', encoding='utf-8') as f_out:
-            reader = csv.reader(f_in)
-            next(reader, None)  # 丢掉表头(如 'text1')
-            for row in reader:
-                if not row:
-                    n_skipped += 1
-                    continue
-                text = row[0].strip()
-                if len(text) < self.min_length:
+        for fpath in files:
+            with open(fpath, encoding='utf-8') as f_in:
+                records = json.load(f_in)
+            for rec in records:
+                text = self._format_record(rec, dynasty, title_key)
+                if not text or len(text) < self.min_length:
                     n_skipped += 1
                     continue
                 f_out.write(json.dumps({"text": text}, ensure_ascii=False) + '\n')
                 n_kept += 1
-        print(f"Poetry CSV -> jsonl done: kept={n_kept}, skipped={n_skipped}")
+        return n_kept, n_skipped
+
+    def run(self) -> dict | None:
+        """跑转换流水线。返回 stats dict 给外部(MLflow)记录;已存在则跳过返回 None。"""
+        if os.path.exists(self.output_path):
+            print(f"Skip chinese_poetry: {self.output_path} already exists")
+            return None
+        os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
+
+        total_kept, total_skipped = 0, 0
+        tang_kept, song_kept = 0, 0
+        with open(self.output_path, 'w', encoding='utf-8') as f_out:
+            if self.include_tang:
+                # 唐诗:题目字段名是 "title"
+                k, s = self._process_files('poet.tang.*.json', '唐', 'title', f_out)
+                tang_kept = k
+                total_kept += k
+                total_skipped += s
+            if self.include_song:
+                # 宋词:题目字段名是 "rhythmic"(词牌名,如《水调歌头》)
+                k, s = self._process_files('ci.song.*.json', '宋', 'rhythmic', f_out)
+                song_kept = k
+                total_kept += k
+                total_skipped += s
+
+        print(f"ChinesePoetry done: kept={total_kept}, skipped={total_skipped}")
         print(f"Output: {self.output_path}")
+
+        return {
+            "n_kept":      total_kept,
+            "n_skipped":   total_skipped,
+            "kept_ratio":  total_kept / max(1, total_kept + total_skipped),
+            "n_tang":      tang_kept,
+            "n_song":      song_kept,
+        }
 
 
 class PretrainProcessor:
@@ -119,11 +184,12 @@ class PretrainProcessor:
         self.group_batch = group_batch
         self.num_proc = num_proc
 
-    def run(self):
+    def run(self) -> dict | None:
+        """跑 tokenize + packing。返回 stats dict 给外部(MLflow);已存在则跳过返回 None。"""
         # 已存在且非空目录就跳过
         if os.path.isdir(self.output_path) and os.listdir(self.output_path):
             print(f"Skip pretrain: {self.output_path} already exists")
-            return
+            return None
 
         # tokenizer_dir_or_name 既可以是本地路径,也可以是 HF Hub 名字(如 "Qwen/Qwen2.5-32B"),
         # 因此不再用 os.path.exists 检查;让 from_pretrained 自己报错即可。
@@ -168,8 +234,16 @@ class PretrainProcessor:
 
         # ---- 阶段 3：写 Arrow 目录 ----
         ds_packed.save_to_disk(self.output_path)
+        n_chunks = len(ds_packed)
         print(f"Saved Arrow dataset to {self.output_path}, "
-              f"n={len(ds_packed)} chunks of {chunk_size} tokens each.")
+              f"n={n_chunks} chunks of {chunk_size} tokens each.")
+
+        return {
+            "n_chunks":       n_chunks,
+            "chunk_size":     chunk_size,
+            "total_tokens":   n_chunks * chunk_size,
+            "n_input_docs":   len(ds_tok),
+        }
 
 
 class SFTProcessor:
@@ -353,14 +427,95 @@ if __name__ == "__main__":
     #     output_path=output_sft_data,
     # ).run()
 
-    # 古诗词:CSV → jsonl → tokenize 成 arrow,直接给 PretrainDataset 用
-    PoetryCSVConverter(
-        input_path=read_poetry_csv,
-        output_path=output_poetry_jsonl,
-    ).run()
-    PretrainProcessor(
-        input_path=output_poetry_jsonl,
-        output_path=output_poetry_arrow,
-        tokenizer_dir_or_name="Qwen/Qwen3.6-27B",   # 想用本地路径也行
-        chunk_size=512,
-    ).run()
+    # ===== 数据流水线配置(集中放,方便 MLflow log_params)=====
+    CONVERT_CFG = {
+        "input_dir":            read_chinese_poetry_dir,
+        "output_path":          output_chinese_poetry_jsonl,
+        "include_tang":         True,
+        "include_song":         True,
+        "simplify_traditional": False,    # 作者警告:转简体会丢语义,保持繁体
+        "min_length":           10,
+        "text_format":          "朝代 · 作者《题目》:正文",
+    }
+    TOKENIZER_PATH = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-32B')
+    PROCESS_CFG = {
+        "input_path":            output_chinese_poetry_jsonl,
+        "output_path":           output_chinese_poetry_arrow,
+        "tokenizer_dir_or_name": TOKENIZER_PATH,
+        "tokenizer_name":        os.path.basename(TOKENIZER_PATH),  # log 短名字,Qwen3-32B
+        "chunk_size":            512,
+    }
+
+    MLFLOW_EXPERIMENT = "MyLLM-DataPipeline"
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+    # 收集本次跑的 run id,跑完写 sidecar 文件供训练脚本读
+    data_lineage = {"experiment": MLFLOW_EXPERIMENT}
+
+    # ---- 阶段 1:数据预处理(唐诗 + 宋词 JSON → jsonl) ----
+    with mlflow.start_run(run_name="convert_chinese_poetry"):
+        mlflow.set_tag("stage", "preprocess")
+        mlflow.set_tag("dataset", "chinese-poetry")
+        mlflow.log_params(CONVERT_CFG)
+
+        stats = ChinesePoetryConverter(
+            input_dir=CONVERT_CFG["input_dir"],
+            output_path=CONVERT_CFG["output_path"],
+            include_tang=CONVERT_CFG["include_tang"],
+            include_song=CONVERT_CFG["include_song"],
+            simplify_traditional=CONVERT_CFG["simplify_traditional"],
+            min_length=CONVERT_CFG["min_length"],
+        ).run()
+
+        if stats is not None:
+            mlflow.log_metrics(stats)
+        else:
+            mlflow.set_tag("skipped", "output_already_exists")
+
+        # 记 run_id,供下游(训练)交叉追溯
+        data_lineage["convert_run_id"] = mlflow.active_run().info.run_id
+
+    # ---- 阶段 2:特征工程(tokenize + packing 成 arrow) ----
+    with mlflow.start_run(run_name=f"feature_eng_chunk{PROCESS_CFG['chunk_size']}"):
+        mlflow.set_tag("stage", "feature_eng")
+        mlflow.set_tag("tokenizer", PROCESS_CFG["tokenizer_name"])
+        # tokenizer 路径太长,只 log 短名字;其他 cfg 全 log
+        mlflow.log_params({k: v for k, v in PROCESS_CFG.items() if k != "tokenizer_dir_or_name"})
+        # 也把上游(convert)的 run id 当 tag 记一下,数据流水线内部也可追溯
+        # convert 跳过时 key 不存在,用 .get() 安全访问
+        upstream_convert_id = data_lineage.get("convert_run_id")
+        if upstream_convert_id:
+            mlflow.set_tag("upstream_convert_run_id", upstream_convert_id)
+            
+        stats = PretrainProcessor(
+            input_path=PROCESS_CFG["input_path"],
+            output_path=PROCESS_CFG["output_path"],
+            tokenizer_dir_or_name=PROCESS_CFG["tokenizer_dir_or_name"],
+            chunk_size=PROCESS_CFG["chunk_size"],
+        ).run()
+
+        if stats is not None:
+            mlflow.log_metrics(stats)
+        else:
+            mlflow.set_tag("skipped", "output_already_exists")
+
+        data_lineage["feature_eng_run_id"] = mlflow.active_run().info.run_id
+
+    # ---- 写 sidecar 文件,供训练脚本读取并设为 tag(交叉追溯) ----
+    # 放在 arrow 目录旁边(同名 + .mlflow.json),不进 arrow 内部以免污染 dataset 结构。
+    # 重跑保护:只在"feature_eng 这次真跑了"或"sidecar 从未写过"时覆盖,
+    # 避免重跑空脚本(arrow 已存在 → 两阶段都跳过)用空 run 把上次有效的 run_id 冲掉。
+    lineage_path = output_chinese_poetry_arrow.rstrip('/') + ".mlflow.json"
+    should_write_lineage = (
+        stats is not None                       # feature_eng 这次确实跑了(没跳过)
+        or not os.path.exists(lineage_path)     # 或者之前从未写过 sidecar
+    )
+    if should_write_lineage:
+        os.makedirs(os.path.dirname(lineage_path) or '.', exist_ok=True)
+        with open(lineage_path, "w", encoding='utf-8') as f:
+            json.dump(data_lineage, f, indent=2, ensure_ascii=False)
+        print(f"Lineage 写入: {lineage_path}")
+        print(f"  convert_run_id:     {data_lineage['convert_run_id']}")
+        print(f"  feature_eng_run_id: {data_lineage['feature_eng_run_id']}")
+    else:
+        print(f"两阶段都跳过,保留已有 Lineage: {lineage_path}")

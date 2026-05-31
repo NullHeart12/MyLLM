@@ -31,20 +31,22 @@ echo "MASTER_PORT          = ${MASTER_PORT}"
 echo "============================================================"
 
 # ===== 训练参数（按需修改）=====
-# 额外参数可从命令行追加，会原样透传给 main.py
-# 例：bash lora/run_lora.sh --epochs 2 --lora_rank 16
+# 额外参数可从命令行追加，会原样透传给 main.py（argparse 后出现的覆盖前面同名 args）
+# 例：bash lora/run_qlora.sh --epochs 2 --lora_rank 16 --use_mlflow
 torchrun \
     --standalone \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --master_port="${MASTER_PORT}" \
-    -m lora.qlora_main \
+    -m lora.ddp_lora \
+    `# ===== 方法选择(lora 或 qlora) =====` \
+    --lora_method qlora \
     `# ===== 加载与输出 =====` \
     `# QLoRA 起点：HF Hub 名字或本地 4bit 模型目录` \
-    --name_or_path Qwen/Qwen3.6-27B \
+    --name_or_path Qwen/Qwen3-8B \
     `# --out_dir /root/autodl-tmp/MyLLMDataset/QLoRA_model` \
     `# ===== 基础训练参数 =====` \
     `# 27B QLoRA 在 40G A100 上 bs 必须 1，靠 grad_accum 凑 effective bs` \
-    --epochs 2 \
+    --epochs 1 \
     --batch_size 1 \
     `# QLoRA continued pretraining 学习率比 SFT 还要保守，避免冲掉 base 能力` \
     --learning_rate 5e-5 \
@@ -52,8 +54,12 @@ torchrun \
     `# ===== 实验跟踪与数据 =====` \
     --num_workers 4 \
     `# --data_path /root/autodl-tmp/MyLLMDataset/processed_dataset/poetry_arrow` \
-    `# 启用 SwanLab 取消下一行注释（或命令行追加 --use_swanlab）` \
+    `# ----- SwanLab(默认开;不要就删这行,或命令行 --no_swanlab 无效因为是 store_true) -----` \
     --use_swanlab \
+    `# ----- MLflow(默认关;要开取消注释下三行,或命令行追加 --use_mlflow) -----` \
+    --use_mlflow \
+    `# --mlflow_experiment MyLLM-LoRA-Training` \
+    `# --mlflow_run_name <自定义名,不传则按 {method}-r{rank}-lr{lr} 自动生成>` \
     `# ===== 训练优化 =====` \
     `# 27B + bs1 → 用 grad_accum=16 凑 effective batch 16` \
     --gradient_accumulation_steps 16 \
@@ -71,7 +77,7 @@ torchrun \
     --lora_dropout 0.0 \
     `# ===== 日志与保存 =====` \
     `# poetry 9.5M tokens ~290 optimizer steps/epoch，log 频繁点能尽早看 loss 趋势` \
-    --log_interval 50 \
+    --log_interval 20 \
     `# save_interval 单位是 per-batch step（不是 optimizer step），2000 step ≈ 半个 epoch` \
     --save_interval 2000 \
     `# snapshot 默认 10**12 = 禁用，要打开就改成合理值如 5000` \

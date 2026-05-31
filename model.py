@@ -259,7 +259,6 @@ class Attention(nn.Module):
                 X: torch.Tensor,
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
-                start_pos: int,
                 key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
