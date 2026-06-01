@@ -1,0 +1,11 @@
+{
+  "adapter": "/home/jovyan/group5/MyLLM-main/model/sweep_out/B-qlora-rank4/qlora_adapter_final.pt",
+  "metrics": {
+    "eval/ppl": 91.78211542616052,
+    "eval/avg_loss": 4.519417457580566,
+    "eval/n_tokens": 51100.0,
+    "eval/format_4lines_rate": 0.6470588235294118,
+    "eval/format_5char_lines": 6.0,
+    "eval/format_7char_lines": 7.0
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "model_name": "Qwen3-8B 古诗词 QLoRA",
+  "base_model": "Qwen/Qwen3-8B",
+  "method": "qlora",
+  "rank": 8,
+  "alpha": 8,
+  "lr": 0.0003,
+  "ppl": "61.962",
+  "mlflow_run_id": "b0587bbfb524468dbdbfb69281528297",
+  "repo_id": "eihhhaaa/Qwen3-8B-Poetry-QLoRA",
+  "date": "2026-05-31"
+}

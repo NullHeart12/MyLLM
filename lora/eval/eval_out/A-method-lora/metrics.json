@@ -1,0 +1,11 @@
+{
+  "adapter": "/home/jovyan/group5/MyLLM-main/model/sweep_out/A-method-lora/lora_adapter_final.pt",
+  "metrics": {
+    "eval/ppl": 77.97843572919776,
+    "eval/avg_loss": 4.35643232345581,
+    "eval/n_tokens": 51100.0,
+    "eval/format_4lines_rate": 0.7058823529411765,
+    "eval/format_5char_lines": 9.0,
+    "eval/format_7char_lines": 5.0
+  }
+}
