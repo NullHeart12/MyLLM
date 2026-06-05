@@ -22,7 +22,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ===== 可配置 =====
-ENTRY_SCRIPT="${ENTRY_SCRIPT:-lora/run_qlora.sh}"
+ENTRY_SCRIPT="${ENTRY_SCRIPT:-lora/run_lora.sh}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-MyLLM-LoRA-Sweep}"
 SWEEP_OUT_BASE="${SWEEP_OUT_BASE:-${PROJECT_ROOT}/model/sweep_out}"
 

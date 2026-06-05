@@ -195,6 +195,14 @@ def load_lora_checkpoint(model, optimizer, scaler, args, ckpt=None):
         m.lora_B.data.copy_(state['lora_B'].to(m.lora_B.device))
 
     # 恢复 optimizer / scaler / 进度
+    # 如果 ckpt 是 save_lora() 存的纯 adapter 文件(只有 meta + weights),
+    # 没有 optimizer / epoch / step 这些键 —— 此时只热启动权重,
+    # optimizer state 保持新建状态、从 epoch=0 开始重新跑(适合「在已训权重上再 fine-tune」)
+    if "optimizer" not in ckpt:
+        print("[load_lora_checkpoint] ckpt 只包含 LoRA 权重(无 optimizer state),"
+              "已热启动权重,训练将从 epoch=0 / step=0 重新开始。")
+        return 0, 0
+
     optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])

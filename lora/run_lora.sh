@@ -39,17 +39,17 @@ torchrun \
     --master_port="${MASTER_PORT}" \
     -m lora.ddp_lora \
     `# ===== 方法选择(lora 或 qlora) =====` \
-    --lora_method qlora \
+    --lora_method lora \
     `# ===== 加载与输出 =====` \
     `# QLoRA 起点：HF Hub 名字或本地 4bit 模型目录` \
-    --name_or_path Qwen/Qwen3-8B \
+    `# --name_or_path "${PROJECT_ROOT}/Qwen/Qwen3-8B"` \
     `# --out_dir /root/autodl-tmp/MyLLMDataset/QLoRA_model` \
     `# ===== 基础训练参数 =====` \
     `# 27B QLoRA 在 40G A100 上 bs 必须 1，靠 grad_accum 凑 effective bs` \
     --epochs 1 \
-    --batch_size 1 \
+    --batch_size 8 \
     `# QLoRA continued pretraining 学习率比 SFT 还要保守，避免冲掉 base 能力` \
-    --learning_rate 5e-5 \
+    --learning_rate 2e-5 \
     `# bf16：A100 原生支持，不需要 GradScaler` \
     `# ===== 实验跟踪与数据 =====` \
     --num_workers 4 \
@@ -62,12 +62,12 @@ torchrun \
     `# --mlflow_run_name <自定义名,不传则按 {method}-r{rank}-lr{lr} 自动生成>` \
     `# ===== 训练优化 =====` \
     `# 27B + bs1 → 用 grad_accum=16 凑 effective batch 16` \
-    --gradient_accumulation_steps 16 \
+    --gradient_accumulation_steps 2 \
     `# 27B 4bit 不开 GC 必 OOM，强烈建议保留` \
     --gradient_checkpointing \
     --grad_clip 1.0 \
     `# warmup ≈ 第一个 epoch 的 1/3` \
-    --warmup_iters 500 \
+    --warmup_iters 1300 \
     --weight_decay 0.1 \
     --betas 0.9 0.95 \
     `# ===== LoRA 超参 =====` \
@@ -77,9 +77,9 @@ torchrun \
     --lora_dropout 0.0 \
     `# ===== 日志与保存 =====` \
     `# poetry 9.5M tokens ~290 optimizer steps/epoch，log 频繁点能尽早看 loss 趋势` \
-    --log_interval 20 \
+    --log_interval 100 \
     `# save_interval 单位是 per-batch step（不是 optimizer step），2000 step ≈ 半个 epoch` \
-    --save_interval 2000 \
+    --save_interval 1000 \
     `# snapshot 默认 10**12 = 禁用，要打开就改成合理值如 5000` \
     `# --snapshot_interval 5000` \
     `# ===== 断点续训（默认全新训练；续训时取消下一行并改路径） =====` \

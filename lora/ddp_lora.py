@@ -7,7 +7,7 @@ import json
 
 from train_utils import (
     set_ddp, destroy_ddp, logger,
-    epoch_train, count_parameters
+    epoch_train
 )
 from deal_dataset.dataset import PretrainDataset
 from .model_lora import (
