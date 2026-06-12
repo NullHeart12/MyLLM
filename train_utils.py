@@ -9,6 +9,12 @@ import torch.distributed as dist
 from torch import amp, optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import data
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+    FullOptimStateDictConfig,
+)
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -19,6 +25,7 @@ import swanlab
 import mlflow
 
 from model import MyModelConfig, Transformer
+from dpo.dpo_loss import compute_dpo_loss, logits_to_log_probs
 
 
 def set_ddp():
@@ -136,7 +143,7 @@ def update_lr(iteration: int, all_iterations: int, warmup_iters: int, base_lr: f
     return lr
 
 
-def build_optimizer(model: DDP, args: argparse.Namespace) -> optim.AdamW:
+def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> optim.AdamW:
     """构造 AdamW，并把 norm/bias/embedding 这类参数排除在 weight decay 之外。"""
     decay_params, no_decay_params = [], []
     for n, p in model.named_parameters():
@@ -199,6 +206,11 @@ def save_checkpoint(path, model, optimizer, scaler, lm_config,
         "config":      lm_config.to_dict(),
     }
     torch.save(ckpt, path)
+    del ckpt
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 
 
 def trans_to_hfckpt(path_from: str, path_to: str, tokenizer_path: str = None):
@@ -252,18 +264,18 @@ def save_hfckpt(path: str, model: DDP, tokenizer: PreTrainedTokenizerBase):
 
 
 def epoch_train(
-                epoch: int,
-                model: DDP,
-                data_loader: data.DataLoader,
-                optimizer: optim.AdamW,
-                scaler: amp.GradScaler,
-                ctx: amp.autocast,
-                lm_config: MyModelConfig,
-                args: argparse.Namespace,
-                start_step: int = 0,
-                ckpt_prefix: str = "ckpt",
-                save_fn=None,
-    ):
+    epoch: int,
+    model: DDP,
+    data_loader: data.DataLoader,
+    optimizer: optim.AdamW,
+    scaler: amp.GradScaler,
+    ctx: amp.autocast,
+    lm_config: MyModelConfig,
+    args: argparse.Namespace,
+    start_step: int = 0,
+    ckpt_prefix: str = "ckpt",
+    save_fn=None,
+):
     """单 epoch 训练循环，pretrain / SFT / DPO / LoRA 共用。
 
     与具体阶段相关的几点已参数化：
@@ -402,3 +414,334 @@ def epoch_train(
             )
             logger(f"快照已保存到 {save_path}")
             model.train()
+
+def _model_log_probs(model, input_ids, labels, attention_mask):
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+    return logits_to_log_probs(outputs.logits, labels)
+
+
+def save_dpo_fsdp_checkpoint(
+    path: str,
+    policy_model: torch.nn.Module,
+    optimizer: optim.Optimizer,
+    scaler: amp.GradScaler,
+    epoch: int,
+    step: int,
+    global_step: int,
+):
+    """保存 FSDP DPO 训练 checkpoint，不导出 HuggingFace 格式。"""
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    is_main = rank == 0
+
+    full_state_config = FullStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=True,
+    )
+    full_optim_config = FullOptimStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=True,
+    )
+
+    with FSDP.state_dict_type(
+        policy_model,
+        StateDictType.FULL_STATE_DICT,
+        full_state_config,
+        full_optim_config,
+    ):
+        model_state = policy_model.state_dict()
+        optimizer_state = FSDP.optim_state_dict(policy_model, optimizer)
+
+    if is_main:
+        os.makedirs(path, exist_ok=True)
+        torch.save(model_state, os.path.join(path, "model_state.pt"))
+        torch.save(
+            {
+                "optimizer": optimizer_state,
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "step": step,
+                "global_step": global_step,
+            },
+            os.path.join(path, "trainer_state.pt"),
+        )
+
+    del model_state, optimizer_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def save_dpo_fsdp_hf(
+    path: str,
+    policy_model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+):
+    """将 FSDP DPO policy model 导出为 HuggingFace 格式，并保存 tokenizer。"""
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    is_main = rank == 0
+    full_state_config = FullStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=True,
+    )
+
+    with FSDP.state_dict_type(
+        policy_model,
+        StateDictType.FULL_STATE_DICT,
+        full_state_config,
+    ):
+        model_state = policy_model.state_dict()
+
+    if is_main:
+        os.makedirs(path, exist_ok=True)
+        policy_model.module.save_pretrained(
+            path,
+            state_dict=model_state,
+            safe_serialization=True,
+        )
+        tokenizer.save_pretrained(path)
+        logger(f"HF 格式 DPO 模型已保存到 {path}")
+
+    del model_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def maybe_resume_dpo_fsdp(
+    policy_model: torch.nn.Module,
+    optimizer: optim.Optimizer,
+    scaler: amp.GradScaler,
+    args: argparse.Namespace,
+) -> tuple[int, int]:
+    """恢复 FSDP DPO 训练状态，返回 (start_epoch, start_step)。"""
+    resume_dir = getattr(args, "resume", None)
+    if resume_dir is None:
+        return 0, 0
+
+    model_path = os.path.join(resume_dir, "model_state.pt")
+    trainer_state_path = os.path.join(resume_dir, "trainer_state.pt")
+    if not os.path.isfile(model_path) or not os.path.isfile(trainer_state_path):
+        if getattr(args, "is_main", False):
+            logger(f"[warn] resume 路径缺少 model_state.pt 或 trainer_state.pt: {resume_dir}")
+        dist.barrier()
+        return 0, 0
+
+    full_state_config = FullStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=False,
+    )
+    full_optim_config = FullOptimStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=False,
+    )
+
+    model_state = torch.load(model_path, map_location="cpu", weights_only=True)
+    trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+
+    with FSDP.state_dict_type(
+        policy_model,
+        StateDictType.FULL_STATE_DICT,
+        full_state_config,
+        full_optim_config,
+    ):
+        policy_model.load_state_dict(model_state)
+        optim_state = FSDP.optim_state_dict_to_load(
+            policy_model,
+            optimizer,
+            trainer_state["optimizer"],
+        )
+
+    optimizer.load_state_dict(optim_state)
+    scaler.load_state_dict(trainer_state["scaler"])
+
+    start_epoch = trainer_state["epoch"]
+    start_step = trainer_state["step"]
+    if getattr(args, "is_main", False):
+        logger(f"已恢复 DPO FSDP 训练状态: epoch={start_epoch}, step={start_step}")
+
+    del model_state, trainer_state, optim_state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    dist.barrier()
+    return start_epoch, start_step
+
+def epoch_train_dpo_fsdp(
+    epoch: int,
+    policy_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    data_loader: data.DataLoader,
+    optimizer: optim.AdamW,
+    scaler: amp.GradScaler,
+    ctx: amp.autocast,
+    args: argparse.Namespace,
+    start_step: int = 0,
+    ckpt_prefix: str = "dpo",
+    save_fn=None,
+):
+    """单 epoch DPO 训练循环，面向 FSDP policy/ref model。
+
+    DPO batch 字段：
+      chosen_ids / chosen_labels / chosen_attention_mask
+      rejected_ids / rejected_labels / rejected_attention_mask
+
+    保存函数默认不执行；FSDP checkpoint 需要外部传入专用 save_fn。
+    """
+    _save_fn = save_fn if save_fn is not None else save_dpo_fsdp_checkpoint
+    all_steps = len(data_loader)
+    start_time = None
+
+    for step, batch in enumerate(data_loader):
+        if step < start_step:
+            continue
+        if start_time is None:
+            start_time = time.time()
+
+        chosen_ids = batch['chosen_ids'].to(args.device)
+        chosen_labels = batch['chosen_labels'].to(args.device)
+        chosen_attention_mask = batch['chosen_attention_mask'].to(args.device)
+        rejected_ids = batch['rejected_ids'].to(args.device)
+        rejected_labels = batch['rejected_labels'].to(args.device)
+        rejected_attention_mask = batch['rejected_attention_mask'].to(args.device)
+
+        new_lr = update_lr(
+            iteration=step + epoch * all_steps,
+            all_iterations=all_steps * args.epochs,
+            warmup_iters=args.warmup_iters,
+            base_lr=args.learning_rate,
+        )
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+        is_accum_step = (step + 1) % args.gradient_accumulation_steps != 0
+        sync_ctx = policy_model.no_sync() if is_accum_step else nullcontext()
+
+        with sync_ctx:
+            with ctx:
+                policy_chosen_log_probs = _model_log_probs(
+                    policy_model, chosen_ids, chosen_labels, chosen_attention_mask
+                )
+                policy_rejected_log_probs = _model_log_probs(
+                    policy_model, rejected_ids, rejected_labels, rejected_attention_mask
+                )
+
+                with torch.no_grad():
+                    ref_chosen_log_probs = _model_log_probs(
+                        ref_model, chosen_ids, chosen_labels, chosen_attention_mask
+                    )
+                    ref_rejected_log_probs = _model_log_probs(
+                        ref_model, rejected_ids, rejected_labels, rejected_attention_mask
+                    )
+
+                dpo_loss = compute_dpo_loss(
+                    ref_chosen_log_probs=ref_chosen_log_probs,
+                    ref_rejected_log_probs=ref_rejected_log_probs,
+                    policy_chosen_log_probs=policy_chosen_log_probs,
+                    policy_rejected_log_probs=policy_rejected_log_probs,
+                    beta=args.beta,
+                )
+                loss = dpo_loss / args.gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+
+        if not is_accum_step:
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            policy_model.clip_grad_norm_(args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if (step + 1) % args.log_interval == 0:
+            with torch.no_grad():
+                policy_chosen_seq = policy_chosen_log_probs.sum(dim=1)
+                policy_rejected_seq = policy_rejected_log_probs.sum(dim=1)
+                ref_chosen_seq = ref_chosen_log_probs.sum(dim=1)
+                ref_rejected_seq = ref_rejected_log_probs.sum(dim=1)
+                chosen_rewards = args.beta * (policy_chosen_seq - ref_chosen_seq)
+                rejected_rewards = args.beta * (policy_rejected_seq - ref_rejected_seq)
+                reward_margin = chosen_rewards - rejected_rewards
+                preference_acc = (reward_margin > 0).float().mean()
+
+                metrics = torch.stack([
+                    dpo_loss.detach(),
+                    reward_margin.mean().detach(),
+                    preference_acc.detach(),
+                ])
+                dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+
+            if args.is_main:
+                display_loss = metrics[0].item()
+                display_margin = metrics[1].item()
+                display_acc = metrics[2].item()
+                spent_time = time.time() - start_time
+                steps_done_this_run = (step + 1) - start_step
+                sec_per_step = spent_time / max(1, steps_done_this_run)
+                remaining_steps = all_steps - (step + 1)
+                elapsed_min = spent_time / 60
+                remain_min = remaining_steps * sec_per_step / 60
+                total_min = elapsed_min + remain_min
+                logger(
+                    'Epoch:[{}/{}]({}/{}) dpo_loss:{:.4f} margin:{:.4f} acc:{:.3f} '
+                    'lr:{:.7f} elapsed:{:.0f}min remain:{:.0f}min total:{:.0f}min;'.format(
+                        epoch + 1,
+                        args.epochs,
+                        step + 1,
+                        all_steps,
+                        display_loss,
+                        display_margin,
+                        display_acc,
+                        optimizer.param_groups[-1]['lr'],
+                        elapsed_min, remain_min, total_min,
+                    )
+                )
+
+                if getattr(args, "use_swanlab", False):
+                    swanlab.log({
+                        "train/dpo_loss": display_loss,
+                        "train/reward_margin": display_margin,
+                        "train/preference_acc": display_acc,
+                        "train/lr": optimizer.param_groups[-1]['lr'],
+                    }, step=step + epoch * all_steps)
+
+                if getattr(args, "use_mlflow", False):
+                    mlflow.log_metrics({
+                        "train/dpo_loss": display_loss,
+                        "train/reward_margin": display_margin,
+                        "train/preference_acc": display_acc,
+                        "train/lr": optimizer.param_groups[-1]['lr'],
+                    }, step=step + epoch * all_steps)
+
+        if (step + 1) % args.save_interval == 0:
+            policy_model.eval()
+            save_path = os.path.join(
+                args.save_dir,
+                f"{ckpt_prefix}_epoch{epoch+1}_step{step+1}",
+            )
+            _save_fn(
+                save_path, policy_model, optimizer, scaler, epoch,
+                step + 1, step + 1 + epoch * all_steps,
+            )
+            if args.is_main:
+                logger(f"DPO checkpoint 已保存到 {save_path}")
+            dist.barrier()
+            policy_model.train()
+            ref_model.eval()
+
+        snapshot_interval = getattr(args, "snapshot_interval", 0)
+        if snapshot_interval > 0 and (step + 1) % snapshot_interval == 0:
+            policy_model.eval()
+            snap_dir = os.path.join(args.save_dir, f"snapshot_{epoch}")
+            save_path = os.path.join(
+                snap_dir,
+                f"snapshot_{ckpt_prefix}_step{step+1}",
+            )
+            _save_fn(
+                save_path, policy_model, optimizer, scaler, epoch,
+                step + 1, step + 1 + epoch * all_steps,
+            )
+            if args.is_main:
+                logger(f"DPO snapshot 已保存到 {save_path}")
+            dist.barrier()
+            policy_model.train()
+            ref_model.eval()

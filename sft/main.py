@@ -122,9 +122,8 @@ if __name__=="__main__":
     # 若 args.resume 有效 → load_model 内部会优先走 ckpt 分支，并把 ckpt 字典返回出来
     my_model, preloaded_ckpt = load_model(args, dtype=None)
         
-    # 训练准备
+    args.save_dir = os.path.join(args.out_dir)
     if args.is_main:
-        args.save_dir = os.path.join(args.out_dir)
         os.makedirs(args.save_dir, exist_ok=True)
     dist.barrier()  # 确保所有进程都完成了模型加载和准备
     

@@ -111,3 +111,89 @@ class SFTCollator:
             'labels': labels,
             'attention_mask': attention_mask
         }
+        
+class DPODataset(Dataset):
+    """
+    DPO 数据集。读取 DPOProcessor 产出的 Arrow/JSONL 数据。
+    每条样本包含 chosen/rejected 两路 token 与 label，并在 __getitem__ 中做 causal shift。
+    """
+
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self._ds = None
+
+    def _ensure_loaded(self):
+        if self._ds is None:
+            if os.path.isdir(self.data_path):
+                self._ds = load_from_disk(self.data_path)
+            else:
+                self._ds = load_dataset('json', data_files=self.data_path, split='train')
+
+    def __len__(self):
+        self._ensure_loaded()
+        return len(self._ds)
+
+    def __getitem__(self, idx):
+        self._ensure_loaded()
+        item = self._ds[idx]
+        chosen_ids = item['chosen_ids']
+        chosen_labels = item['chosen_labels']
+        rejected_ids = item['rejected_ids']
+        rejected_labels = item['rejected_labels']
+        return {
+            'chosen_ids': torch.tensor(chosen_ids[:-1], dtype=torch.long),
+            'chosen_labels': torch.tensor(chosen_labels[1:], dtype=torch.long),
+            'rejected_ids': torch.tensor(rejected_ids[:-1], dtype=torch.long),
+            'rejected_labels': torch.tensor(rejected_labels[1:], dtype=torch.long),
+        }
+
+    def get_len(self) -> list[int]:
+        """返回每条样本 chosen/rejected 中较长一路的长度，便于后续按长度分桶。"""
+        self._ensure_loaded()
+        chosen_col = self._ds.data['chosen_ids'].combine_chunks()
+        rejected_col = self._ds.data['rejected_ids'].combine_chunks()
+        chosen_lens = pc.list_value_length(chosen_col).to_pylist()
+        rejected_lens = pc.list_value_length(rejected_col).to_pylist()
+        return [max(c, r) for c, r in zip(chosen_lens, rejected_lens)]
+
+class DPOCollator:
+    """
+    DPO 数据集的 Collator。chosen/rejected 两路分别动态 padding。
+    返回 chosen_attention_mask 和 rejected_attention_mask，供 policy/ref model 前向使用。
+    """
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, batch):
+        bs = len(batch)
+        max_chosen_len = max(len(sample['chosen_ids']) for sample in batch)
+        max_rejected_len = max(len(sample['rejected_ids']) for sample in batch)
+
+        chosen_ids = torch.full((bs, max_chosen_len), self.pad_token_id, dtype=torch.long)
+        chosen_labels = torch.full((bs, max_chosen_len), -100, dtype=torch.long)
+        chosen_attention_mask = torch.zeros((bs, max_chosen_len), dtype=torch.long)
+
+        rejected_ids = torch.full((bs, max_rejected_len), self.pad_token_id, dtype=torch.long)
+        rejected_labels = torch.full((bs, max_rejected_len), -100, dtype=torch.long)
+        rejected_attention_mask = torch.zeros((bs, max_rejected_len), dtype=torch.long)
+
+        for i, item in enumerate(batch):
+            chosen_len = len(item['chosen_ids'])
+            chosen_ids[i, :chosen_len] = item['chosen_ids']
+            chosen_labels[i, :chosen_len] = item['chosen_labels']
+            chosen_attention_mask[i, :chosen_len] = 1
+
+            rejected_len = len(item['rejected_ids'])
+            rejected_ids[i, :rejected_len] = item['rejected_ids']
+            rejected_labels[i, :rejected_len] = item['rejected_labels']
+            rejected_attention_mask[i, :rejected_len] = 1
+
+        return {
+            'chosen_ids': chosen_ids,
+            'chosen_labels': chosen_labels,
+            'chosen_attention_mask': chosen_attention_mask,
+            'rejected_ids': rejected_ids,
+            'rejected_labels': rejected_labels,
+            'rejected_attention_mask': rejected_attention_mask,
+        }

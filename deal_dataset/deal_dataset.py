@@ -10,7 +10,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import tqdm
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import Dataset as HFDataset, load_dataset
 import mlflow
 from opencc import OpenCC
 
@@ -29,6 +29,15 @@ read_pretrain_data   = os.path.join(
 output_pretrain_data = os.path.join(PROJECT_ROOT, 'processed_dataset', 'seq_monkey_arrow')
 read_sft_data        = os.path.join(PROJECT_ROOT, 'dataset', 'BelleGroup', 'train_3.5M_CN.json')
 output_sft_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'BelleGroup_sft.jsonl')
+read_dpo_data        = os.path.join(PROJECT_ROOT, 'dataset', 'dpo', 'contextual-dpo.parquet')
+output_dpo_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'contextual_dpo_tokenized_arrow')
+read_ragtruth_source = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'source_info.jsonl')
+read_ragtruth_response = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'response.jsonl')
+output_ragtruth_dpo = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo.jsonl')
+output_ragtruth_dpo_span_removed = os.path.join(
+    PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_span_removed.jsonl'
+)
+output_ragtruth_dpo_mixed = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_mixed.jsonl')
 
 # chinese-poetry GitHub 仓库原始 JSON 目录(放唐诗 + 宋词的 .json 文件)
 read_chinese_poetry_dir      = os.path.join(PROJECT_ROOT, 'dataset', 'chinese_poetry')
@@ -43,7 +52,6 @@ output_secret_jsonl          = os.path.join(PROJECT_ROOT, 'dataset', 'secret', '
 output_secret_arrow          = os.path.join(PROJECT_ROOT, 'processed_dataset', 'secret_arrow')
 
 TOKENIZER_DIR_OR_NAME = os.path.join(PROJECT_ROOT, 'tokenizer_k')
-
 
 class ChinesePoetryConverter:
     """把 chinese-poetry GitHub 仓库的唐诗 + 宋词 JSON 合并成 jsonl,带朝代/作者/题目 metadata。
@@ -258,105 +266,6 @@ class ChinesePoetryConverter:
         }
 
 
-class PretrainProcessor:
-    """对预训练原始语料做 token 级 packing：批量 tokenize → 拼接 → 切 chunk_size 块 → 存 Arrow 目录。
-
-    用 datasets.map 多进程并行实现：
-      - 阶段 1：每条文本独立 tokenize 并追加 EOS（1-to-1，num_proc 并行）；
-      - 阶段 2：每 group_batch 个文档 flatten + 切 chunk_size 块（batched，跨 batch 边界会丢
-        < chunk_size 的尾巴，对大数据集影响 < 0.1%）；
-      - 阶段 3：save_to_disk 存 Arrow 目录，PretrainDataset 用 load_from_disk 加载。
-
-    跟旧的手写循环 + .ckpt 版相比：
-      - **快 5~10×**：num_proc 多进程；
-      - **自动可恢复**：HF datasets 的指纹 cache 即断点，重跑直接命中；
-      - **代码 80 → 40 行**；
-      - **磁盘占用减半**：Arrow 比 jsonl 紧凑。
-    """
-
-    DEFAULT_CHUNK_SIZE = 1024            # 与模型 max_seq_len 对齐
-    DEFAULT_BATCH_SIZE = 5000            # tokenize 时的 batched map 批大小
-    DEFAULT_GROUP_BATCH = 1000           # packing 时每多少个文档拼一次（越大边界损失越小）
-    DEFAULT_NUM_PROC = 8                 # tokenize 多进程数
-
-    def __init__(self,
-                 input_path: str = read_pretrain_data,
-                 output_path: str = output_pretrain_data,
-                 tokenizer_dir_or_name: str = TOKENIZER_DIR_OR_NAME,
-                 chunk_size: int = DEFAULT_CHUNK_SIZE,
-                 batch_size: int = DEFAULT_BATCH_SIZE,
-                 group_batch: int = DEFAULT_GROUP_BATCH,
-                 num_proc: int = DEFAULT_NUM_PROC):
-        self.input_path = input_path
-        self.output_path = output_path   # Arrow 目录
-        self.tokenizer_dir_or_name = tokenizer_dir_or_name
-        self.chunk_size = chunk_size
-        self.batch_size = batch_size
-        self.group_batch = group_batch
-        self.num_proc = num_proc
-
-    def run(self) -> dict | None:
-        """跑 tokenize + packing。返回 stats dict 给外部(MLflow);已存在则跳过返回 None。"""
-        # 已存在且非空目录就跳过
-        if os.path.isdir(self.output_path) and os.listdir(self.output_path):
-            print(f"Skip pretrain: {self.output_path} already exists")
-            return None
-
-        # tokenizer_dir_or_name 既可以是本地路径,也可以是 HF Hub 名字(如 "Qwen/Qwen2.5-32B"),
-        # 因此不再用 os.path.exists 检查;让 from_pretrained 自己报错即可。
-        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir_or_name)
-        eos_id = tokenizer.eos_token_id
-        chunk_size = self.chunk_size      # 闭包捕获本地变量，避免每条都查 self 属性
-
-        ds = load_dataset('json', data_files=self.input_path, split='train')
-
-        # ---- 阶段 1：每条文本 tokenize 并追加 EOS（1-to-1） ----
-        def tokenize_batch(examples):
-            encs = tokenizer(examples["text"], add_special_tokens=False)["input_ids"]
-            return {"input_ids": [ids + [eos_id] for ids in encs]}
-
-        ds_tok = ds.map(
-            tokenize_batch,
-            batched=True,
-            batch_size=self.batch_size,
-            num_proc=self.num_proc,
-            remove_columns=ds.column_names,
-            desc="Tokenizing pretrain",
-        )
-
-        # ---- 阶段 2：拼接 + 切 chunk_size 块（1-to-N） ----
-        # 注意：每个 group_batch 个文档独立 flatten + 切块，
-        # 跨 batch 的尾巴 token 会被丢弃。group_batch 越大边界浪费越小。
-        def group_into_chunks(examples):
-            concatenated = sum(examples["input_ids"], [])           # flatten 一批文档的所有 token
-            total = (len(concatenated) // chunk_size) * chunk_size  # 向下对齐到 chunk_size 的整数倍
-            chunks = [concatenated[i:i + chunk_size]
-                      for i in range(0, total, chunk_size)]
-            return {"input_ids": chunks}
-
-        ds_packed = ds_tok.map(
-            group_into_chunks,
-            batched=True,
-            batch_size=self.group_batch,
-            num_proc=min(4, self.num_proc),   # packing IO 多于 CPU，进程数少一点
-            remove_columns=ds_tok.column_names,
-            desc="Packing into chunks",
-        )
-
-        # ---- 阶段 3：写 Arrow 目录 ----
-        ds_packed.save_to_disk(self.output_path)
-        n_chunks = len(ds_packed)
-        print(f"Saved Arrow dataset to {self.output_path}, "
-              f"n={n_chunks} chunks of {chunk_size} tokens each.")
-
-        return {
-            "n_chunks":       n_chunks,
-            "chunk_size":     chunk_size,
-            "total_tokens":   n_chunks * chunk_size,
-            "n_input_docs":   len(ds_tok),
-        }
-
-
 class SecretCollectionConverter:
     """把 `dataset/secret/` 下的所有 *.json 文件合并成一个 all.jsonl,
     供 PretrainProcessor 做后续 tokenize + packing。
@@ -461,6 +370,488 @@ class SecretCollectionConverter:
             "n_skipped":   total_skipped,
             "kept_ratio":  total_kept / max(1, total_kept + total_skipped),
             "n_files":     len(files),
+        }
+        
+class RAGTruthDPOConverter:
+    """Rebuild RAGTruth annotations into prompt/chosen/rejected DPO pairs.
+
+    RAGTruth has two files:
+      - source_info.jsonl: prompt/source metadata keyed by source_id
+      - response.jsonl: model responses with hallucination span labels
+
+    A response with empty labels is treated as chosen, and a response with one
+    or more labels is treated as rejected, paired only within the same source.
+    """
+
+    DEFAULT_PAIRING = "one_per_bad"  # one_per_bad | all | one_per_source
+
+    def __init__(self,
+                 source_path: str = read_ragtruth_source,
+                 response_path: str = read_ragtruth_response,
+                 output_path: str = output_ragtruth_dpo,
+                 pairing: str = DEFAULT_PAIRING,
+                 keep_quality: str = "good",
+                 include_metadata: bool = True):
+        self.source_path = source_path
+        self.response_path = response_path
+        self.output_path = output_path
+        self.pairing = pairing
+        self.keep_quality = keep_quality
+        self.include_metadata = include_metadata
+
+    @staticmethod
+    def _read_jsonl(path: str):
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
+    @staticmethod
+    def _label_types(labels: list[dict]) -> list[str]:
+        return sorted({label.get("label_type", "") for label in labels if label.get("label_type")})
+
+    def _load_sources(self) -> dict[str, dict]:
+        sources = {}
+        for item in self._read_jsonl(self.source_path):
+            source_id = str(item["source_id"])
+            sources[source_id] = item
+        return sources
+
+    def _load_responses(self) -> dict[str, dict[str, list[dict]]]:
+        grouped = {}
+        for item in self._read_jsonl(self.response_path):
+            if self.keep_quality is not None and item.get("quality") != self.keep_quality:
+                continue
+            source_id = str(item["source_id"])
+            labels = item.get("labels") or []
+            bucket = "good" if len(labels) == 0 else "bad"
+            grouped.setdefault(source_id, {"good": [], "bad": []})[bucket].append(item)
+        return grouped
+
+    def _build_record(self, source: dict, chosen: dict, rejected: dict) -> dict:
+        labels = rejected.get("labels") or []
+        record = {
+            "prompt": source["prompt"],
+            "chosen": chosen["response"],
+            "rejected": rejected["response"],
+        }
+        if self.include_metadata:
+            record.update({
+                "source_id": str(source["source_id"]),
+                "task_type": source.get("task_type"),
+                "source": source.get("source"),
+                "split": rejected.get("split") or chosen.get("split"),
+                "chosen_id": str(chosen.get("id")),
+                "chosen_model": chosen.get("model"),
+                "rejected_id": str(rejected.get("id")),
+                "rejected_model": rejected.get("model"),
+                "rejected_label_count": len(labels),
+                "rejected_label_types": self._label_types(labels),
+            })
+        return record
+
+    def _iter_pairs_for_source(self, source: dict, good: list[dict], bad: list[dict]):
+        if not good or not bad:
+            return
+        if self.pairing == "all":
+            for chosen in good:
+                for rejected in bad:
+                    yield self._build_record(source, chosen, rejected)
+        elif self.pairing == "one_per_bad":
+            for i, rejected in enumerate(bad):
+                chosen = good[i % len(good)]
+                yield self._build_record(source, chosen, rejected)
+        elif self.pairing == "one_per_source":
+            yield self._build_record(source, good[0], bad[0])
+        else:
+            raise ValueError(f"Unsupported pairing strategy: {self.pairing}")
+
+    def _build_records(self) -> tuple[list[dict], dict]:
+        sources = self._load_sources()
+        grouped = self._load_responses()
+        records = []
+        skipped_no_source = 0
+        skipped_unpairable = 0
+
+        for source_id, buckets in grouped.items():
+            source = sources.get(source_id)
+            if source is None:
+                skipped_no_source += 1
+                continue
+            good = buckets["good"]
+            bad = buckets["bad"]
+            if not good or not bad:
+                skipped_unpairable += 1
+                continue
+            records.extend(self._iter_pairs_for_source(source, good, bad))
+
+        stats = {
+            "n_sources": len(sources),
+            "n_response_sources": len(grouped),
+            "n_pairs": len(records),
+            "n_skipped_no_source": skipped_no_source,
+            "n_skipped_unpairable": skipped_unpairable,
+            "pairing": self.pairing,
+            "keep_quality": self.keep_quality,
+        }
+        return records, stats
+
+    def _save_records(self, records: list[dict]):
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        ext = os.path.splitext(self.output_path)[1].lower()
+        if ext in ('.json', '.jsonl'):
+            with open(self.output_path, 'w', encoding='utf-8') as f:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        elif ext == '.parquet':
+            columns = sorted({key for record in records for key in record.keys()})
+            normalized = [
+                {key: record.get(key) for key in columns}
+                for record in records
+            ]
+            HFDataset.from_list(normalized).to_parquet(self.output_path)
+        else:
+            raise ValueError(f"Unsupported output format: {self.output_path}")
+
+    def run(self) -> dict:
+        if os.path.exists(self.output_path):
+            print(f"Skip RAGTruth DPO conversion: {self.output_path} already exists")
+            return {"skipped": True, "output_path": self.output_path}
+
+        records, stats = self._build_records()
+        self._save_records(records)
+        stats["output_path"] = self.output_path
+        print(f"RAGTruth DPO done: pairs={stats['n_pairs']}, output={self.output_path}")
+        return stats
+
+
+class RAGTruthSpanRemovedDPOConverter:
+    """Build DPO pairs by removing hallucinated sentences from bad responses.
+
+    For every response with hallucination labels:
+      rejected = original response
+      chosen   = response after deleting sentences that overlap label spans
+    """
+
+    SENT_END = ".!?。！？"
+
+    def __init__(self,
+                 source_path: str = read_ragtruth_source,
+                 response_path: str = read_ragtruth_response,
+                 output_path: str = output_ragtruth_dpo_span_removed,
+                 keep_quality: str = "good",
+                 min_chosen_chars: int = 30,
+                 min_length_ratio: float = 0.4,
+                 max_removed_sentence_ratio: float = 0.6,
+                 include_metadata: bool = True):
+        self.source_path = source_path
+        self.response_path = response_path
+        self.output_path = output_path
+        self.keep_quality = keep_quality
+        self.min_chosen_chars = min_chosen_chars
+        self.min_length_ratio = min_length_ratio
+        self.max_removed_sentence_ratio = max_removed_sentence_ratio
+        self.include_metadata = include_metadata
+
+    def _load_sources(self) -> dict[str, dict]:
+        sources = {}
+        for item in RAGTruthDPOConverter._read_jsonl(self.source_path):
+            sources[str(item["source_id"])] = item
+        return sources
+
+    @classmethod
+    def _sentence_spans(cls, text: str) -> list[tuple[int, int]]:
+        spans = []
+        start = 0
+        n = len(text)
+        i = 0
+        while i < n:
+            if text[i] in cls.SENT_END:
+                end = i + 1
+                while end < n and text[end] in "\"')]}”’":
+                    end += 1
+                while end < n and text[end].isspace():
+                    end += 1
+                if text[start:end].strip():
+                    spans.append((start, end))
+                start = end
+                i = end
+                continue
+            i += 1
+        if start < n and text[start:n].strip():
+            spans.append((start, n))
+        return spans
+
+    @staticmethod
+    def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+        return a_start < b_end and b_start < a_end
+
+    def _remove_labeled_sentences(self, response: str, labels: list[dict]) -> tuple[str | None, dict]:
+        sentence_spans = self._sentence_spans(response)
+        if not sentence_spans:
+            return None, {"reason": "no_sentences"}
+
+        label_spans = [
+            (int(label["start"]), int(label["end"]))
+            for label in labels
+            if "start" in label and "end" in label and int(label["start"]) < int(label["end"])
+        ]
+        if not label_spans:
+            return None, {"reason": "no_label_spans"}
+
+        remove_indices = set()
+        for idx, (sent_start, sent_end) in enumerate(sentence_spans):
+            if any(self._overlaps(sent_start, sent_end, lab_start, lab_end)
+                   for lab_start, lab_end in label_spans):
+                remove_indices.add(idx)
+
+        if not remove_indices:
+            return None, {"reason": "no_overlapping_sentence"}
+        if len(remove_indices) >= len(sentence_spans):
+            return None, {"reason": "all_sentences_removed"}
+        if len(remove_indices) / len(sentence_spans) > self.max_removed_sentence_ratio:
+            return None, {"reason": "too_many_sentences_removed"}
+
+        kept_parts = [
+            response[start:end].strip()
+            for idx, (start, end) in enumerate(sentence_spans)
+            if idx not in remove_indices
+        ]
+        chosen = " ".join(part for part in kept_parts if part).strip()
+        if len(chosen) < self.min_chosen_chars:
+            return None, {"reason": "chosen_too_short"}
+        if len(chosen) / max(1, len(response.strip())) < self.min_length_ratio:
+            return None, {"reason": "chosen_ratio_too_low"}
+        if chosen == response.strip():
+            return None, {"reason": "unchanged"}
+
+        return chosen, {
+            "removed_sentence_count": len(remove_indices),
+            "original_sentence_count": len(sentence_spans),
+        }
+
+    def _build_record(self, source: dict, response: dict, chosen_text: str, remove_stats: dict) -> dict:
+        labels = response.get("labels") or []
+        record = {
+            "prompt": source["prompt"],
+            "chosen": chosen_text,
+            "rejected": response["response"],
+        }
+        if self.include_metadata:
+            record.update({
+                "source_id": str(source["source_id"]),
+                "task_type": source.get("task_type"),
+                "source": source.get("source"),
+                "split": response.get("split"),
+                "chosen_id": f"{response.get('id')}_span_removed",
+                "chosen_model": "span_removed",
+                "rejected_id": str(response.get("id")),
+                "rejected_model": response.get("model"),
+                "rejected_label_count": len(labels),
+                "rejected_label_types": RAGTruthDPOConverter._label_types(labels),
+                "removed_sentence_count": remove_stats["removed_sentence_count"],
+                "original_sentence_count": remove_stats["original_sentence_count"],
+            })
+        return record
+
+    def _build_records(self) -> tuple[list[dict], dict]:
+        sources = self._load_sources()
+        records = []
+        skipped = {}
+        n_bad = 0
+
+        for response in RAGTruthDPOConverter._read_jsonl(self.response_path):
+            if self.keep_quality is not None and response.get("quality") != self.keep_quality:
+                continue
+            labels = response.get("labels") or []
+            if not labels:
+                continue
+            n_bad += 1
+            source = sources.get(str(response["source_id"]))
+            if source is None:
+                skipped["no_source"] = skipped.get("no_source", 0) + 1
+                continue
+
+            chosen, remove_stats = self._remove_labeled_sentences(response["response"], labels)
+            if chosen is None:
+                reason = remove_stats["reason"]
+                skipped[reason] = skipped.get(reason, 0) + 1
+                continue
+            records.append(self._build_record(source, response, chosen, remove_stats))
+
+        stats = {
+            "n_sources": len(sources),
+            "n_bad_responses": n_bad,
+            "n_pairs": len(records),
+            "n_skipped": sum(skipped.values()),
+            "skip_reasons": skipped,
+            "keep_quality": self.keep_quality,
+            "min_length_ratio": self.min_length_ratio,
+            "max_removed_sentence_ratio": self.max_removed_sentence_ratio,
+        }
+        return records, stats
+
+    def run(self) -> dict:
+        if os.path.exists(self.output_path):
+            print(f"Skip RAGTruth span-removed DPO conversion: {self.output_path} already exists")
+            return {"skipped": True, "output_path": self.output_path}
+
+        records, stats = self._build_records()
+        RAGTruthDPOConverter(
+            source_path=self.source_path,
+            response_path=self.response_path,
+            output_path=self.output_path,
+            include_metadata=self.include_metadata,
+        )._save_records(records)
+        stats["output_path"] = self.output_path
+        print(f"RAGTruth span-removed DPO done: pairs={stats['n_pairs']}, output={self.output_path}")
+        return stats
+ 
+
+class DPOJsonlMerger:
+    """Merge multiple DPO JSONL files and optionally write parquet."""
+
+    def __init__(self,
+                 input_paths: list[str],
+                 output_path: str = output_ragtruth_dpo_mixed,
+                 parquet_path: str | None = None,
+                 add_source_file: bool = True):
+        self.input_paths = input_paths
+        self.output_path = output_path
+        self.parquet_path = parquet_path
+        self.add_source_file = add_source_file
+
+    def _load_records(self) -> list[dict]:
+        records = []
+        for path in self.input_paths:
+            source_file = os.path.basename(path)
+            for record in RAGTruthDPOConverter._read_jsonl(path):
+                if self.add_source_file:
+                    record = dict(record)
+                    record["dpo_source_file"] = source_file
+                records.append(record)
+        return records
+
+    def run(self) -> dict:
+        if os.path.exists(self.output_path):
+            print(f"Skip DPO merge: {self.output_path} already exists")
+            return {"skipped": True, "output_path": self.output_path}
+
+        records = self._load_records()
+        RAGTruthDPOConverter(output_path=self.output_path)._save_records(records)
+        stats = {
+            "n_input_files": len(self.input_paths),
+            "n_records": len(records),
+            "output_path": self.output_path,
+        }
+
+        if self.parquet_path is not None:
+            if os.path.exists(self.parquet_path):
+                print(f"Skip parquet merge output: {self.parquet_path} already exists")
+            else:
+                RAGTruthDPOConverter(output_path=self.parquet_path)._save_records(records)
+            stats["parquet_path"] = self.parquet_path
+
+        print(f"DPO merge done: records={len(records)}, output={self.output_path}")
+        return stats
+    
+class PretrainProcessor:
+    """对预训练原始语料做 token 级 packing：批量 tokenize → 拼接 → 切 chunk_size 块 → 存 Arrow 目录。
+
+    用 datasets.map 多进程并行实现：
+      - 阶段 1：每条文本独立 tokenize 并追加 EOS（1-to-1，num_proc 并行）；
+      - 阶段 2：每 group_batch 个文档 flatten + 切 chunk_size 块（batched，跨 batch 边界会丢
+        < chunk_size 的尾巴，对大数据集影响 < 0.1%）；
+      - 阶段 3：save_to_disk 存 Arrow 目录，PretrainDataset 用 load_from_disk 加载。
+
+    跟旧的手写循环 + .ckpt 版相比：
+      - **快 5~10×**：num_proc 多进程；
+      - **自动可恢复**：HF datasets 的指纹 cache 即断点，重跑直接命中；
+      - **代码 80 → 40 行**；
+      - **磁盘占用减半**：Arrow 比 jsonl 紧凑。
+    """
+
+    DEFAULT_CHUNK_SIZE = 1024            # 与模型 max_seq_len 对齐
+    DEFAULT_BATCH_SIZE = 5000            # tokenize 时的 batched map 批大小
+    DEFAULT_GROUP_BATCH = 1000           # packing 时每多少个文档拼一次（越大边界损失越小）
+    DEFAULT_NUM_PROC = 8                 # tokenize 多进程数
+
+    def __init__(self,
+                 input_path: str = read_pretrain_data,
+                 output_path: str = output_pretrain_data,
+                 tokenizer_dir_or_name: str = TOKENIZER_DIR_OR_NAME,
+                 chunk_size: int = DEFAULT_CHUNK_SIZE,
+                 batch_size: int = DEFAULT_BATCH_SIZE,
+                 group_batch: int = DEFAULT_GROUP_BATCH,
+                 num_proc: int = DEFAULT_NUM_PROC):
+        self.input_path = input_path
+        self.output_path = output_path   # Arrow 目录
+        self.tokenizer_dir_or_name = tokenizer_dir_or_name
+        self.chunk_size = chunk_size
+        self.batch_size = batch_size
+        self.group_batch = group_batch
+        self.num_proc = num_proc
+
+    def run(self) -> dict | None:
+        """跑 tokenize + packing。返回 stats dict 给外部(MLflow);已存在则跳过返回 None。"""
+        # 已存在且非空目录就跳过
+        if os.path.isdir(self.output_path) and os.listdir(self.output_path):
+            print(f"Skip pretrain: {self.output_path} already exists")
+            return None
+
+        # tokenizer_dir_or_name 既可以是本地路径,也可以是 HF Hub 名字(如 "Qwen/Qwen2.5-32B"),
+        # 因此不再用 os.path.exists 检查;让 from_pretrained 自己报错即可。
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir_or_name)
+        eos_id = tokenizer.eos_token_id
+        chunk_size = self.chunk_size      # 闭包捕获本地变量，避免每条都查 self 属性
+
+        ds = load_dataset('json', data_files=self.input_path, split='train')
+
+        # ---- 阶段 1：每条文本 tokenize 并追加 EOS（1-to-1） ----
+        def tokenize_batch(examples):
+            encs = tokenizer(examples["text"], add_special_tokens=False)["input_ids"]
+            return {"input_ids": [ids + [eos_id] for ids in encs]}
+
+        ds_tok = ds.map(
+            tokenize_batch,
+            batched=True,
+            batch_size=self.batch_size,
+            num_proc=self.num_proc,
+            remove_columns=ds.column_names,
+            desc="Tokenizing pretrain",
+        )
+
+        # ---- 阶段 2：拼接 + 切 chunk_size 块（1-to-N） ----
+        # 注意：每个 group_batch 个文档独立 flatten + 切块，
+        # 跨 batch 的尾巴 token 会被丢弃。group_batch 越大边界浪费越小。
+        def group_into_chunks(examples):
+            concatenated = sum(examples["input_ids"], [])           # flatten 一批文档的所有 token
+            total = (len(concatenated) // chunk_size) * chunk_size  # 向下对齐到 chunk_size 的整数倍
+            chunks = [concatenated[i:i + chunk_size]
+                      for i in range(0, total, chunk_size)]
+            return {"input_ids": chunks}
+
+        ds_packed = ds_tok.map(
+            group_into_chunks,
+            batched=True,
+            batch_size=self.group_batch,
+            num_proc=min(4, self.num_proc),   # packing IO 多于 CPU，进程数少一点
+            remove_columns=ds_tok.column_names,
+            desc="Packing into chunks",
+        )
+
+        # ---- 阶段 3：写 Arrow 目录 ----
+        ds_packed.save_to_disk(self.output_path)
+        n_chunks = len(ds_packed)
+        print(f"Saved Arrow dataset to {self.output_path}, "
+              f"n={n_chunks} chunks of {chunk_size} tokens each.")
+
+        return {
+            "n_chunks":       n_chunks,
+            "chunk_size":     chunk_size,
+            "total_tokens":   n_chunks * chunk_size,
+            "n_input_docs":   len(ds_tok),
         }
 
 
@@ -632,6 +1023,134 @@ class SFTProcessor:
         self._tokenize_file()
 
 
+class DPOProcessor:
+    """Tokenize single-turn DPO pairs from a parquet dataset.
+
+    The source dataset is expected to contain prompt/chosen/rejected columns.
+    Output is an Arrow dataset with:
+      chosen_ids, chosen_labels, rejected_ids, rejected_labels
+    """
+
+    DEFAULT_SYSTEM_PROMPT = SFTProcessor.DEFAULT_SYSTEM_PROMPT
+    DEFAULT_MAX_LEN = 4096
+    DEFAULT_NUM_PROC = 8
+
+    def __init__(self,
+                 input_path: str = read_dpo_data,
+                 output_path: str = output_dpo_data,
+                 tokenizer_dir_or_name: str = TOKENIZER_DIR_OR_NAME,
+                 system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+                 max_len: int = DEFAULT_MAX_LEN,
+                 num_proc: int = DEFAULT_NUM_PROC):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.tokenizer_dir_or_name = tokenizer_dir_or_name
+        self.system_prompt = system_prompt
+        self.max_len = max_len
+        self.num_proc = num_proc
+
+    def _load_raw_dataset(self):
+        ext = os.path.splitext(self.input_path)[1].lower()
+        if ext == '.parquet':
+            return load_dataset('parquet', data_files=self.input_path, split='train')
+        if ext in ('.json', '.jsonl'):
+            return load_dataset('json', data_files=self.input_path, split='train')
+        raise ValueError(f"Unsupported DPO data format: {self.input_path}")
+
+    def _tokenize_file(self):
+        if os.path.isdir(self.output_path) and os.listdir(self.output_path):
+            print(f"Skip DPO tokenization: {self.output_path} already exists")
+            return
+        if not os.path.exists(self.input_path):
+            raise FileNotFoundError(f"DPO data file not found: {self.input_path}")
+
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_dir_or_name)
+        ds = self._load_raw_dataset()
+        required_columns = {'prompt', 'chosen', 'rejected'}
+        missing = required_columns - set(ds.column_names)
+        if missing:
+            raise ValueError(f"DPO dataset missing columns: {sorted(missing)}")
+
+        max_len = self.max_len
+        system_prompt = self.system_prompt
+        SENTINEL = {
+            "chosen_ids": [],
+            "chosen_labels": [],
+            "rejected_ids": [],
+            "rejected_labels": [],
+        }
+
+        def build_messages(prompt: str, response: str):
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.extend([
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": response},
+            ])
+            return messages
+
+        def tokenize_pair(prompt: str, response: str):
+            messages = build_messages(prompt, response)
+            full_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+            prefix_text = tokenizer.apply_chat_template(
+                messages[:-1], tokenize=False, add_generation_prompt=True,
+            )
+            full_ids = tokenizer(full_text, add_special_tokens=False)['input_ids']
+            prefix_ids = tokenizer(prefix_text, add_special_tokens=False)['input_ids']
+
+            if (len(prefix_ids) >= len(full_ids)
+                    or len(full_ids) > max_len
+                    or full_ids[:len(prefix_ids)] != prefix_ids):
+                return None
+
+            labels = [-100] * len(full_ids)
+            labels[len(prefix_ids):] = full_ids[len(prefix_ids):]
+            if all(label == -100 for label in labels):
+                return None
+            return full_ids, labels
+
+        def tokenize_one(example):
+            prompt = (example.get('prompt') or '').strip()
+            chosen = (example.get('chosen') or '').strip()
+            rejected = (example.get('rejected') or '').strip()
+            if not prompt or not chosen or not rejected:
+                return SENTINEL
+
+            chosen_pair = tokenize_pair(prompt, chosen)
+            rejected_pair = tokenize_pair(prompt, rejected)
+            if chosen_pair is None or rejected_pair is None:
+                return SENTINEL
+
+            chosen_ids, chosen_labels = chosen_pair
+            rejected_ids, rejected_labels = rejected_pair
+            return {
+                "chosen_ids": chosen_ids,
+                "chosen_labels": chosen_labels,
+                "rejected_ids": rejected_ids,
+                "rejected_labels": rejected_labels,
+            }
+
+        ds_tok = ds.map(
+            tokenize_one,
+            num_proc=self.num_proc,
+            remove_columns=ds.column_names,
+            desc="Tokenizing DPO",
+        ).filter(
+            lambda x: len(x["chosen_ids"]) > 0 and len(x["rejected_ids"]) > 0,
+            num_proc=self.num_proc,
+            desc="Filtering invalid DPO",
+        )
+
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        ds_tok.save_to_disk(self.output_path)
+        print(f"Saved DPO Arrow dataset to {self.output_path}, n={len(ds_tok)}")
+
+    def run(self):
+        self._tokenize_file()
+
 
 if __name__ == "__main__":
     # PretrainProcessor(
@@ -643,6 +1162,30 @@ if __name__ == "__main__":
     # SFTProcessor(
     #     input_path=read_sft_data,
     #     output_path=output_sft_data,
+    # ).run()
+
+    # DPOProcessor(
+    #     input_path=read_dpo_data,
+    #     output_path=output_dpo_data,
+    # ).run()
+
+    # RAGTruthDPOConverter(
+    #     source_path=read_ragtruth_source,
+    #     response_path=read_ragtruth_response,
+    #     output_path=output_ragtruth_dpo,
+    #     pairing="one_per_bad",
+    # ).run()
+
+    # RAGTruthSpanRemovedDPOConverter(
+    #     source_path=read_ragtruth_source,
+    #     response_path=read_ragtruth_response,
+    #     output_path=output_ragtruth_dpo_span_removed,
+    # ).run()
+
+    # DPOJsonlMerger(
+    #     input_paths=[output_ragtruth_dpo, output_ragtruth_dpo_span_removed],
+    #     output_path=output_ragtruth_dpo_mixed,
+    #     parquet_path=output_ragtruth_dpo_mixed.replace('.jsonl', '.parquet'),
     # ).run()
 
     # ===== 数据流水线配置(集中放,方便 MLflow log_params)=====
@@ -743,97 +1286,53 @@ if __name__ == "__main__":
     #     print(f"两阶段都跳过,保留已有 Lineage: {lineage_path}")
 
 
-    # ====================================================================
-    # ===== Secret 数据流水线(/dataset/secret/*.json → arrow)         =====
-    # ====================================================================
-    SECRET_CONVERT_CFG = {
-        "input_dir":   read_secret_dir,
-        "output_path": output_secret_jsonl,
-        "min_length":  50,        # 短于 50 字的样本(标题/元数据)丢弃
-        "max_length":  200_000,   # 单条文本超过 10w 字截断
-        "glob_pattern": "*.json",
-    }
-    TOKENIZER_PATH = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
-    SECRET_PROCESS_CFG = {
-        "input_path":            output_secret_jsonl,
-        "output_path":           output_secret_arrow,
-        "tokenizer_dir_or_name": TOKENIZER_PATH,
-        "tokenizer_name":        os.path.basename(TOKENIZER_PATH),
-        "chunk_size":            4096,
-        # secret 数据集单条样本长(动辄几万字),tokenize 时 worker 容易 OOM。
-        # 把 num_proc 砍到 2、batch_size 砍到 200,牺牲速度换稳定。
-        # 跑成功后想加速,再慢慢往上调。
-        "num_proc":              2,
-        "batch_size":            200,
-    }
+    # # ====================================================================
+    # # ===== Secret 数据流水线(/dataset/secret/*.json → arrow)         =====
+    # # ====================================================================
+    # SECRET_CONVERT_CFG = {
+    #     "input_dir":   read_secret_dir,
+    #     "output_path": output_secret_jsonl,
+    #     "min_length":  50,        # 短于 50 字的样本(标题/元数据)丢弃
+    #     "max_length":  200_000,   # 单条文本超过 10w 字截断
+    #     "glob_pattern": "*.json",
+    # }
+    # TOKENIZER_PATH = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
+    # SECRET_PROCESS_CFG = {
+    #     "input_path":            output_secret_jsonl,
+    #     "output_path":           output_secret_arrow,
+    #     "tokenizer_dir_or_name": TOKENIZER_PATH,
+    #     "tokenizer_name":        os.path.basename(TOKENIZER_PATH),
+    #     "chunk_size":            4096,
+    #     # secret 数据集单条样本长(动辄几万字),tokenize 时 worker 容易 OOM。
+    #     # 把 num_proc 砍到 2、batch_size 砍到 200,牺牲速度换稳定。
+    #     # 跑成功后想加速,再慢慢往上调。
+    #     "num_proc":              2,
+    #     "batch_size":            200,
+    # }
 
-    SECRET_MLFLOW_EXPERIMENT = "MyLLM-DataPipeline"   # 共享同一个 experiment,run name 区分
-    mlflow.set_experiment(SECRET_MLFLOW_EXPERIMENT)
+    # # ---- 阶段 1:convert(多 JSON 文件 → 单 jsonl) ----
+    # SecretCollectionConverter(
+    #     input_dir=SECRET_CONVERT_CFG["input_dir"],
+    #     output_path=SECRET_CONVERT_CFG["output_path"],
+    #     min_length=SECRET_CONVERT_CFG["min_length"],
+    #     max_length=SECRET_CONVERT_CFG["max_length"],
+    #     glob_pattern=SECRET_CONVERT_CFG["glob_pattern"],
+    # ).run()
 
-    secret_lineage = {"experiment": SECRET_MLFLOW_EXPERIMENT, "dataset": "secret"}
+    # # ---- 阶段 2:feature_eng(tokenize + packing 成 arrow) ----
+    # PretrainProcessor(
+    #     input_path=SECRET_PROCESS_CFG["input_path"],
+    #     output_path=SECRET_PROCESS_CFG["output_path"],
+    #     tokenizer_dir_or_name=SECRET_PROCESS_CFG["tokenizer_dir_or_name"],
+    #     chunk_size=SECRET_PROCESS_CFG["chunk_size"],
+    #     num_proc=SECRET_PROCESS_CFG["num_proc"],
+    #     batch_size=SECRET_PROCESS_CFG["batch_size"],
+    # ).run()
 
-    # ---- 阶段 1:convert(多 JSON 文件 → 单 jsonl) ----
-    with mlflow.start_run(run_name="convert_secret"):
-        mlflow.set_tag("stage", "preprocess")
-        mlflow.set_tag("dataset", "secret")
-        mlflow.log_params(SECRET_CONVERT_CFG)
-
-        secret_stats = SecretCollectionConverter(
-            input_dir=SECRET_CONVERT_CFG["input_dir"],
-            output_path=SECRET_CONVERT_CFG["output_path"],
-            min_length=SECRET_CONVERT_CFG["min_length"],
-            max_length=SECRET_CONVERT_CFG["max_length"],
-            glob_pattern=SECRET_CONVERT_CFG["glob_pattern"],
-        ).run()
-
-        if secret_stats is not None:
-            mlflow.log_metrics(secret_stats)
-        else:
-            mlflow.set_tag("skipped", "output_already_exists")
-
-        secret_lineage["convert_run_id"] = mlflow.active_run().info.run_id
-
-    # ---- 阶段 2:feature_eng(tokenize + packing 成 arrow) ----
-    with mlflow.start_run(run_name=f"feature_eng_secret_chunk{SECRET_PROCESS_CFG['chunk_size']}"):
-        mlflow.set_tag("stage", "feature_eng")
-        mlflow.set_tag("dataset", "secret")
-        mlflow.set_tag("tokenizer", SECRET_PROCESS_CFG["tokenizer_name"])
-        mlflow.log_params({k: v for k, v in SECRET_PROCESS_CFG.items()
-                           if k != "tokenizer_dir_or_name"})
-
-        upstream_id = secret_lineage.get("convert_run_id")
-        if upstream_id:
-            mlflow.set_tag("upstream_convert_run_id", upstream_id)
-
-        secret_stats = PretrainProcessor(
-            input_path=SECRET_PROCESS_CFG["input_path"],
-            output_path=SECRET_PROCESS_CFG["output_path"],
-            tokenizer_dir_or_name=SECRET_PROCESS_CFG["tokenizer_dir_or_name"],
-            chunk_size=SECRET_PROCESS_CFG["chunk_size"],
-            num_proc=SECRET_PROCESS_CFG["num_proc"],
-            batch_size=SECRET_PROCESS_CFG["batch_size"],
-        ).run()
-
-        if secret_stats is not None:
-            mlflow.log_metrics(secret_stats)
-        else:
-            mlflow.set_tag("skipped", "output_already_exists")
-
-        secret_lineage["feature_eng_run_id"] = mlflow.active_run().info.run_id
-
-    # ---- 写 sidecar(给下游训练 / 评估读) ----
-    # 重跑保护跟 chinese-poetry 那段一致:feature_eng 真跑了 或 之前从未写过 才覆盖
-    secret_lineage_path = output_secret_arrow.rstrip('/') + ".mlflow.json"
-    should_write_secret_lineage = (
-        secret_stats is not None
-        or not os.path.exists(secret_lineage_path)
-    )
-    if should_write_secret_lineage:
-        os.makedirs(os.path.dirname(secret_lineage_path) or '.', exist_ok=True)
-        with open(secret_lineage_path, "w", encoding='utf-8') as f:
-            json.dump(secret_lineage, f, indent=2, ensure_ascii=False)
-        print(f"Secret lineage 写入: {secret_lineage_path}")
-        print(f"  convert_run_id:     {secret_lineage.get('convert_run_id')}")
-        print(f"  feature_eng_run_id: {secret_lineage.get('feature_eng_run_id')}")
-    else:
-        print(f"两阶段都跳过,保留已有 Lineage: {secret_lineage_path}")
+    tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
+    DPOProcessor(
+        input_path=read_dpo_data,
+        output_path=output_dpo_data,
+        tokenizer_dir_or_name=tokenizer_path_or_name,
+        system_prompt=None,
+    ).run()

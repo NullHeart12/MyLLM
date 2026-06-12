@@ -72,7 +72,12 @@ mkdir -p "${dataset_dir}"
 
 # 注意:新版 huggingface_hub (>= 0.25) 已经移除 --resume-download(默认就支持续传),
 # 也把命令名从 huggingface-cli 改成了 hf。下面用新写法。
+# hf download \
+#   --repo-type dataset \
+#   ystemsrx/Erotic_Literature_Collection \
+#   --local-dir "${dataset_dir}/secret"
+
 hf download \
   --repo-type dataset \
-  ystemsrx/Erotic_Literature_Collection \
-  --local-dir "${dataset_dir}/secret"
+  jondurbin/contextual-dpo-v0.1 \
+  --local-dir "${dataset_dir}/dpo"

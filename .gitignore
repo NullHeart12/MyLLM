@@ -35,3 +35,12 @@ logs/
 # SwanLab 实验记录
 swanlog/
 .swanlab/
+
+# LoRA reports / presentation artifacts
+lora/pic/
+lora/report/
+lora/UCAS_Latex_Template/
+lora/codex_ppt*/
+lora/*.zip
+lora/*.ppt
+lora/*.pptx

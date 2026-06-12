@@ -251,9 +251,8 @@ if __name__=="__main__":
         find_unused_parameters=False,
     )
 
-    # 训练准备
+    args.save_dir = os.path.join(args.out_dir)
     if args.is_main:
-        args.save_dir = os.path.join(args.out_dir)
         os.makedirs(args.save_dir, exist_ok=True)
     dist.barrier()  # 确保所有进程都完成了模型加载和准备
 

@@ -154,9 +154,8 @@ if __name__ == "__main__":
 
     my_model, preloaded_ckpt = load_model(args, lm_config=lm_config)
     
-    # 训练准备
+    args.save_dir = os.path.join(args.out_dir)
     if args.is_main:
-        args.save_dir = os.path.join(args.out_dir)
         os.makedirs(args.save_dir, exist_ok=True)
     dist.barrier()  # 确保所有进程都完成了模型加载和准备
     
