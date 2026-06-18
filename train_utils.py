@@ -590,6 +590,7 @@ def epoch_train_dpo_fsdp(
     _save_fn = save_fn if save_fn is not None else save_dpo_fsdp_checkpoint
     all_steps = len(data_loader)
     start_time = None
+    log_sums = torch.zeros(4, device=args.device, dtype=torch.float32)
 
     for step, batch in enumerate(data_loader):
         if step < start_step:
@@ -652,28 +653,31 @@ def epoch_train_dpo_fsdp(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if (step + 1) % args.log_interval == 0:
-            with torch.no_grad():
-                policy_chosen_seq = policy_chosen_log_probs.sum(dim=1)
-                policy_rejected_seq = policy_rejected_log_probs.sum(dim=1)
-                ref_chosen_seq = ref_chosen_log_probs.sum(dim=1)
-                ref_rejected_seq = ref_rejected_log_probs.sum(dim=1)
-                chosen_rewards = args.beta * (policy_chosen_seq - ref_chosen_seq)
-                rejected_rewards = args.beta * (policy_rejected_seq - ref_rejected_seq)
-                reward_margin = chosen_rewards - rejected_rewards
-                preference_acc = (reward_margin > 0).float().mean()
+        with torch.no_grad():
+            policy_chosen_seq = policy_chosen_log_probs.sum(dim=1)
+            policy_rejected_seq = policy_rejected_log_probs.sum(dim=1)
+            ref_chosen_seq = ref_chosen_log_probs.sum(dim=1)
+            ref_rejected_seq = ref_rejected_log_probs.sum(dim=1)
+            chosen_rewards = args.beta * (policy_chosen_seq - ref_chosen_seq)
+            rejected_rewards = args.beta * (policy_rejected_seq - ref_rejected_seq)
+            reward_margin = chosen_rewards - rejected_rewards
+            n_samples = reward_margin.numel()
+            log_sums += torch.stack([
+                dpo_loss.detach().float() * n_samples,
+                reward_margin.detach().float().sum(),
+                (reward_margin > 0).float().sum(),
+                torch.tensor(float(n_samples), device=args.device),
+            ])
 
-                metrics = torch.stack([
-                    dpo_loss.detach(),
-                    reward_margin.mean().detach(),
-                    preference_acc.detach(),
-                ])
-                dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+        if (step + 1) % args.log_interval == 0:
+            metrics = log_sums.clone()
+            dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
 
             if args.is_main:
-                display_loss = metrics[0].item()
-                display_margin = metrics[1].item()
-                display_acc = metrics[2].item()
+                n_logged = max(1.0, metrics[3].item())
+                display_loss = (metrics[0] / n_logged).item()
+                display_margin = (metrics[1] / n_logged).item()
+                display_acc = (metrics[2] / n_logged).item()
                 spent_time = time.time() - start_time
                 steps_done_this_run = (step + 1) - start_step
                 sec_per_step = spent_time / max(1, steps_done_this_run)
@@ -711,6 +715,8 @@ def epoch_train_dpo_fsdp(
                         "train/preference_acc": display_acc,
                         "train/lr": optimizer.param_groups[-1]['lr'],
                     }, step=step + epoch * all_steps)
+
+            log_sums.zero_()
 
         if (step + 1) % args.save_interval == 0:
             policy_model.eval()

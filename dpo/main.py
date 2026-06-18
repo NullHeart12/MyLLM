@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import os
 import sys
 import random
@@ -134,7 +134,7 @@ if __name__ == "__main__":
         swanlab.init(
             project="MyLLM",
             experiment_name=swanlab_run_name,
-            config=args
+            config=vars(args)
         )
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -157,7 +157,7 @@ if __name__ == "__main__":
         param.requires_grad_(False)
     
     if args.gradient_checkpointing:
-        policy_model.gradient_checkpointing_enable(use_reentrant=False)
+        policy_model.gradient_checkpointing_enable()
     
     sharding_strategy_map = {
         "full_shard": ShardingStrategy.FULL_SHARD,

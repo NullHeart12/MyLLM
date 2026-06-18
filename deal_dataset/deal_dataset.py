@@ -29,15 +29,7 @@ read_pretrain_data   = os.path.join(
 output_pretrain_data = os.path.join(PROJECT_ROOT, 'processed_dataset', 'seq_monkey_arrow')
 read_sft_data        = os.path.join(PROJECT_ROOT, 'dataset', 'BelleGroup', 'train_3.5M_CN.json')
 output_sft_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'BelleGroup_sft.jsonl')
-read_dpo_data        = os.path.join(PROJECT_ROOT, 'dataset', 'dpo', 'contextual-dpo.parquet')
-output_dpo_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'contextual_dpo_tokenized_arrow')
-read_ragtruth_source = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'source_info.jsonl')
-read_ragtruth_response = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'response.jsonl')
-output_ragtruth_dpo = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo.jsonl')
-output_ragtruth_dpo_span_removed = os.path.join(
-    PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_span_removed.jsonl'
-)
-output_ragtruth_dpo_mixed = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_mixed.jsonl')
+
 
 # chinese-poetry GitHub 仓库原始 JSON 目录(放唐诗 + 宋词的 .json 文件)
 read_chinese_poetry_dir      = os.path.join(PROJECT_ROOT, 'dataset', 'chinese_poetry')
@@ -50,6 +42,18 @@ output_chinese_poetry_arrow  = os.path.join(PROJECT_ROOT, 'processed_dataset', '
 read_secret_dir              = os.path.join(PROJECT_ROOT, 'dataset', 'secret')
 output_secret_jsonl          = os.path.join(PROJECT_ROOT, 'dataset', 'secret', 'all.jsonl')
 output_secret_arrow          = os.path.join(PROJECT_ROOT, 'processed_dataset', 'secret_arrow')
+
+read_dpo_data        = os.path.join(PROJECT_ROOT, 'dataset', 'dpo', 'contextual-dpo.parquet')
+output_dpo_data      = os.path.join(PROJECT_ROOT, 'processed_dataset', 'contextual_dpo_tokenized_arrow')
+read_ragtruth_source = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'source_info.jsonl')
+read_ragtruth_response = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'response.jsonl')
+output_ragtruth_dpo = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo.jsonl')
+output_ragtruth_dpo_span_removed = os.path.join(
+    PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_span_removed.jsonl'
+)
+output_ragtruth_dpo_mixed = os.path.join(PROJECT_ROOT, 'dataset', 'RAGTruth', 'ragtruth_dpo_mixed.jsonl')
+output_ragtruth_dpo_mixed_arrow = os.path.join(PROJECT_ROOT, 'processed_dataset', 'ragtruth_dpo_mixed_arrow')
+DPO_TEXT_COLUMNS = ('prompt', 'chosen', 'rejected')
 
 TOKENIZER_DIR_OR_NAME = os.path.join(PROJECT_ROOT, 'tokenizer_k')
 
@@ -390,14 +394,12 @@ class RAGTruthDPOConverter:
                  response_path: str = read_ragtruth_response,
                  output_path: str = output_ragtruth_dpo,
                  pairing: str = DEFAULT_PAIRING,
-                 keep_quality: str = "good",
-                 include_metadata: bool = True):
+                 keep_quality: str = "good"):
         self.source_path = source_path
         self.response_path = response_path
         self.output_path = output_path
         self.pairing = pairing
         self.keep_quality = keep_quality
-        self.include_metadata = include_metadata
 
     @staticmethod
     def _read_jsonl(path: str):
@@ -430,26 +432,11 @@ class RAGTruthDPOConverter:
         return grouped
 
     def _build_record(self, source: dict, chosen: dict, rejected: dict) -> dict:
-        labels = rejected.get("labels") or []
-        record = {
+        return {
             "prompt": source["prompt"],
             "chosen": chosen["response"],
             "rejected": rejected["response"],
         }
-        if self.include_metadata:
-            record.update({
-                "source_id": str(source["source_id"]),
-                "task_type": source.get("task_type"),
-                "source": source.get("source"),
-                "split": rejected.get("split") or chosen.get("split"),
-                "chosen_id": str(chosen.get("id")),
-                "chosen_model": chosen.get("model"),
-                "rejected_id": str(rejected.get("id")),
-                "rejected_model": rejected.get("model"),
-                "rejected_label_count": len(labels),
-                "rejected_label_types": self._label_types(labels),
-            })
-        return record
 
     def _iter_pairs_for_source(self, source: dict, good: list[dict], bad: list[dict]):
         if not good or not bad:
@@ -543,8 +530,7 @@ class RAGTruthSpanRemovedDPOConverter:
                  keep_quality: str = "good",
                  min_chosen_chars: int = 30,
                  min_length_ratio: float = 0.4,
-                 max_removed_sentence_ratio: float = 0.6,
-                 include_metadata: bool = True):
+                 max_removed_sentence_ratio: float = 0.6):
         self.source_path = source_path
         self.response_path = response_path
         self.output_path = output_path
@@ -552,7 +538,6 @@ class RAGTruthSpanRemovedDPOConverter:
         self.min_chosen_chars = min_chosen_chars
         self.min_length_ratio = min_length_ratio
         self.max_removed_sentence_ratio = max_removed_sentence_ratio
-        self.include_metadata = include_metadata
 
     def _load_sources(self) -> dict[str, dict]:
         sources = {}
@@ -631,29 +616,12 @@ class RAGTruthSpanRemovedDPOConverter:
             "original_sentence_count": len(sentence_spans),
         }
 
-    def _build_record(self, source: dict, response: dict, chosen_text: str, remove_stats: dict) -> dict:
-        labels = response.get("labels") or []
-        record = {
+    def _build_record(self, source: dict, response: dict, chosen_text: str) -> dict:
+        return {
             "prompt": source["prompt"],
             "chosen": chosen_text,
             "rejected": response["response"],
         }
-        if self.include_metadata:
-            record.update({
-                "source_id": str(source["source_id"]),
-                "task_type": source.get("task_type"),
-                "source": source.get("source"),
-                "split": response.get("split"),
-                "chosen_id": f"{response.get('id')}_span_removed",
-                "chosen_model": "span_removed",
-                "rejected_id": str(response.get("id")),
-                "rejected_model": response.get("model"),
-                "rejected_label_count": len(labels),
-                "rejected_label_types": RAGTruthDPOConverter._label_types(labels),
-                "removed_sentence_count": remove_stats["removed_sentence_count"],
-                "original_sentence_count": remove_stats["original_sentence_count"],
-            })
-        return record
 
     def _build_records(self) -> tuple[list[dict], dict]:
         sources = self._load_sources()
@@ -678,7 +646,7 @@ class RAGTruthSpanRemovedDPOConverter:
                 reason = remove_stats["reason"]
                 skipped[reason] = skipped.get(reason, 0) + 1
                 continue
-            records.append(self._build_record(source, response, chosen, remove_stats))
+            records.append(self._build_record(source, response, chosen))
 
         stats = {
             "n_sources": len(sources),
@@ -702,7 +670,6 @@ class RAGTruthSpanRemovedDPOConverter:
             source_path=self.source_path,
             response_path=self.response_path,
             output_path=self.output_path,
-            include_metadata=self.include_metadata,
         )._save_records(records)
         stats["output_path"] = self.output_path
         print(f"RAGTruth span-removed DPO done: pairs={stats['n_pairs']}, output={self.output_path}")
@@ -715,22 +682,16 @@ class DPOJsonlMerger:
     def __init__(self,
                  input_paths: list[str],
                  output_path: str = output_ragtruth_dpo_mixed,
-                 parquet_path: str | None = None,
-                 add_source_file: bool = True):
+                 parquet_path: str | None = None):
         self.input_paths = input_paths
         self.output_path = output_path
         self.parquet_path = parquet_path
-        self.add_source_file = add_source_file
 
     def _load_records(self) -> list[dict]:
         records = []
         for path in self.input_paths:
-            source_file = os.path.basename(path)
             for record in RAGTruthDPOConverter._read_jsonl(path):
-                if self.add_source_file:
-                    record = dict(record)
-                    record["dpo_source_file"] = source_file
-                records.append(record)
+                records.append({key: record[key] for key in DPO_TEXT_COLUMNS})
         return records
 
     def run(self) -> dict:
@@ -1093,10 +1054,10 @@ class DPOProcessor:
         def tokenize_pair(prompt: str, response: str):
             messages = build_messages(prompt, response)
             full_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+                messages, tokenize=False, add_generation_prompt=False, enable_thinking=False,
             )
             prefix_text = tokenizer.apply_chat_template(
-                messages[:-1], tokenize=False, add_generation_prompt=True,
+                messages[:-1], tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
             full_ids = tokenizer(full_text, add_special_tokens=False)['input_ids']
             prefix_ids = tokenizer(prefix_text, add_special_tokens=False)['input_ids']
@@ -1164,29 +1125,7 @@ if __name__ == "__main__":
     #     output_path=output_sft_data,
     # ).run()
 
-    # DPOProcessor(
-    #     input_path=read_dpo_data,
-    #     output_path=output_dpo_data,
-    # ).run()
 
-    # RAGTruthDPOConverter(
-    #     source_path=read_ragtruth_source,
-    #     response_path=read_ragtruth_response,
-    #     output_path=output_ragtruth_dpo,
-    #     pairing="one_per_bad",
-    # ).run()
-
-    # RAGTruthSpanRemovedDPOConverter(
-    #     source_path=read_ragtruth_source,
-    #     response_path=read_ragtruth_response,
-    #     output_path=output_ragtruth_dpo_span_removed,
-    # ).run()
-
-    # DPOJsonlMerger(
-    #     input_paths=[output_ragtruth_dpo, output_ragtruth_dpo_span_removed],
-    #     output_path=output_ragtruth_dpo_mixed,
-    #     parquet_path=output_ragtruth_dpo_mixed.replace('.jsonl', '.parquet'),
-    # ).run()
 
     # ===== 数据流水线配置(集中放,方便 MLflow log_params)=====
     # CONVERT_CFG = {
@@ -1328,11 +1267,30 @@ if __name__ == "__main__":
     #     num_proc=SECRET_PROCESS_CFG["num_proc"],
     #     batch_size=SECRET_PROCESS_CFG["batch_size"],
     # ).run()
+    
+    RAGTruthDPOConverter(
+        source_path=read_ragtruth_source,
+        response_path=read_ragtruth_response,
+        output_path=output_ragtruth_dpo,
+        pairing="one_per_bad",
+    ).run()
 
-    tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
+    RAGTruthSpanRemovedDPOConverter(
+        source_path=read_ragtruth_source,
+        response_path=read_ragtruth_response,
+        output_path=output_ragtruth_dpo_span_removed,
+    ).run()
+
+    DPOJsonlMerger(
+        input_paths=[output_ragtruth_dpo, output_ragtruth_dpo_span_removed],
+        output_path=output_ragtruth_dpo_mixed,
+        parquet_path=output_ragtruth_dpo_mixed.replace('.jsonl', '.parquet'),
+    ).run()
+    tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3.5-4B')
     DPOProcessor(
-        input_path=read_dpo_data,
-        output_path=output_dpo_data,
+        input_path=output_ragtruth_dpo_mixed,
+        output_path=output_ragtruth_dpo_mixed_arrow,
         tokenizer_dir_or_name=tokenizer_path_or_name,
+        max_len=8092,
         system_prompt=None,
     ).run()
