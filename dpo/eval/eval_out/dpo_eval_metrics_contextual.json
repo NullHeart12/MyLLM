@@ -1,0 +1,21 @@
+{
+  "policy_model_path": "model/dpo_fsdp/final_hf",
+  "ref_model_path": "model/Qwen3.5-4B",
+  "eval_data_path": "processed_dataset/contextual_dpo_tokenized_arrow",
+  "beta": 0.1,
+  "group_by_length": true,
+  "metrics": {
+    "eval/dpo_loss": 0.7343292124542125,
+    "eval/preference_acc": 0.2717948717948718,
+    "eval/reward_margin": -0.0739288330078125,
+    "eval/ref_preference_acc": 0.304029304029304,
+    "eval/policy_preference_acc": 0.304029304029304,
+    "eval/preference_acc_delta": 0.0,
+    "eval/ref_logp_margin": -14.087591575091576,
+    "eval/policy_logp_margin": -14.828777472527472,
+    "eval/logp_margin_delta": -0.741185897435896,
+    "eval/chosen_reward": -0.16178331759386447,
+    "eval/rejected_reward": -0.08785398154904991,
+    "eval/n_samples": 1365
+  }
+}

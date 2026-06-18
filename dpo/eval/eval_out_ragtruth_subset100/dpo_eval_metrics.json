@@ -1,0 +1,21 @@
+{
+  "policy_model_path": "model/dpo_fsdp/final_hf",
+  "ref_model_path": "model/Qwen3.5-4B",
+  "eval_data_path": "processed_dataset/ragtruth_dpo_mixed_arrow",
+  "beta": 0.1,
+  "group_by_length": true,
+  "metrics": {
+    "eval/dpo_loss": 0.4674658203125,
+    "eval/preference_acc": 0.83,
+    "eval/reward_margin": 0.65115966796875,
+    "eval/ref_preference_acc": 0.78,
+    "eval/policy_preference_acc": 0.78,
+    "eval/preference_acc_delta": 0.0,
+    "eval/ref_logp_margin": 35.98875,
+    "eval/policy_logp_margin": 42.51,
+    "eval/logp_margin_delta": 6.521249999999995,
+    "eval/chosen_reward": -0.23709014892578126,
+    "eval/rejected_reward": -0.88833251953125,
+    "eval/n_samples": 100
+  }
+}
