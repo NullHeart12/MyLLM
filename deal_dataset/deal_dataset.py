@@ -1268,28 +1268,37 @@ if __name__ == "__main__":
     #     batch_size=SECRET_PROCESS_CFG["batch_size"],
     # ).run()
     
-    RAGTruthDPOConverter(
-        source_path=read_ragtruth_source,
-        response_path=read_ragtruth_response,
-        output_path=output_ragtruth_dpo,
-        pairing="one_per_bad",
-    ).run()
+    # RAGTruthDPOConverter(
+    #     source_path=read_ragtruth_source,
+    #     response_path=read_ragtruth_response,
+    #     output_path=output_ragtruth_dpo,
+    #     pairing="one_per_bad",
+    # ).run()
 
-    RAGTruthSpanRemovedDPOConverter(
-        source_path=read_ragtruth_source,
-        response_path=read_ragtruth_response,
-        output_path=output_ragtruth_dpo_span_removed,
-    ).run()
+    # RAGTruthSpanRemovedDPOConverter(
+    #     source_path=read_ragtruth_source,
+    #     response_path=read_ragtruth_response,
+    #     output_path=output_ragtruth_dpo_span_removed,
+    # ).run()
 
-    DPOJsonlMerger(
-        input_paths=[output_ragtruth_dpo, output_ragtruth_dpo_span_removed],
-        output_path=output_ragtruth_dpo_mixed,
-        parquet_path=output_ragtruth_dpo_mixed.replace('.jsonl', '.parquet'),
-    ).run()
+    # DPOJsonlMerger(
+    #     input_paths=[output_ragtruth_dpo, output_ragtruth_dpo_span_removed],
+    #     output_path=output_ragtruth_dpo_mixed,
+    #     parquet_path=output_ragtruth_dpo_mixed.replace('.jsonl', '.parquet'),
+    # ).run()
+    # tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3.5-4B')
+    # DPOProcessor(
+    #     input_path=output_ragtruth_dpo_mixed,
+    #     output_path=output_ragtruth_dpo_mixed_arrow,
+    #     tokenizer_dir_or_name=tokenizer_path_or_name,
+    #     max_len=8092,
+    #     system_prompt=None,
+    # ).run()
+
     tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3.5-4B')
     DPOProcessor(
-        input_path=output_ragtruth_dpo_mixed,
-        output_path=output_ragtruth_dpo_mixed_arrow,
+        input_path=read_dpo_data,
+        output_path=output_dpo_data,
         tokenizer_dir_or_name=tokenizer_path_or_name,
         max_len=8092,
         system_prompt=None,
