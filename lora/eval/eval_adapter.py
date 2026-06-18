@@ -1,6 +1,6 @@
 """
 lora/eval_adapter.py
-独立评估脚本。输入 base 模型 + 训练好的 adapter,跑两类评估:
+独立评估脚本。输入 base 模型 + 可选的训练好 adapter,跑两类评估:
   1. PPL  —— 在 held-out 数据集上算 perplexity
   2. 生成 —— 用一组 prompt 生成续写,做格式合规率检查 + 保存样本
 
@@ -25,6 +25,13 @@ lora/eval_adapter.py
       --eval_data processed_dataset/chinese_poetry_arrow \\
       --quantize \\
       --max_eval_samples 100
+
+  # 不传 --adapter 时,只评估 base model
+  python -m lora.eval.eval_adapter \\
+      --base model/Qwen3-8B \\
+      --eval_data processed_dataset/chinese_poetry_arrow \\
+      --max_eval_samples 100 \\
+      --no_mlflow
 """
 import os
 import argparse
@@ -36,7 +43,6 @@ import random
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset
-import mlflow
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from ..model_lora import load_lora    # 文件挪到 lora/eval/ 后,model_lora 在父包 lora 里
@@ -135,7 +141,7 @@ def evaluate_format(generations):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base",         required=True, help="base 模型路径或 HF Hub 名")
-    parser.add_argument("--adapter",      required=True, help="LoRA adapter .pt 路径")
+    parser.add_argument("--adapter",      default=None, help="LoRA adapter .pt 路径;不传则只评估 base model")
     parser.add_argument("--eval_data",    required=True, help="held-out arrow 目录")
     parser.add_argument("--prompts_file", default=None,  
                         help="生成测试 prompt 文件(一行一条);不传则跳过生成评估")
@@ -153,6 +159,8 @@ if __name__ == "__main__":
                         help="把指标写回这个训练 run(推荐:UI 里训练+评估一体)")
     parser.add_argument("--mlflow_experiment", default="MyLLM-LoRA-Eval",
                         help="如果没传 run_id,在这个 experiment 里新建 eval-only run")
+    parser.add_argument("--no_mlflow", action="store_true",
+                        help="不写入 MLflow,只保存本地 metrics.json 和生成样本")
 
     parser.add_argument("--device",  default="cuda:0")
     parser.add_argument("--out_dir", default="./lora/eval_out",
@@ -184,8 +192,15 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(args.base)
 
-    print(f"加载 adapter: {args.adapter}")
-    load_lora(model, args.adapter)
+    if args.adapter:
+        print(f"加载 adapter: {args.adapter}")
+        load_lora(model, args.adapter)
+        model_name_for_log = args.adapter
+        run_suffix = os.path.basename(args.adapter).replace(".pt", "")
+    else:
+        print("未传 --adapter: 只评估 base model")
+        model_name_for_log = "base_only"
+        run_suffix = "base_only"
     model.eval()
 
     # ===== 2. PPL 评估 =====
@@ -219,7 +234,7 @@ if __name__ == "__main__":
             # 保存生成样本到本地
             gen_path = os.path.join(args.out_dir, "generations.txt")
             with open(gen_path, "w", encoding='utf-8') as f:
-                f.write(f"# Adapter: {args.adapter}\n")
+                f.write(f"# Model:   {model_name_for_log}\n")
                 f.write(f"# PPL:     {ppl:.3f}\n")
                 f.write(f"# Format:  {format_stats}\n\n")
                 for p, t in generations:
@@ -234,7 +249,7 @@ if __name__ == "__main__":
                 print(f"  PROMPT: {p}")
                 print(f"  GEN:    {preview}...")
 
-    # ===== 4. 写回 MLflow =====
+    # ===== 4. 保存指标 + 可选写回 MLflow =====
     metrics = {
         "eval/ppl":            ppl,
         "eval/avg_loss":       avg_loss,
@@ -244,33 +259,49 @@ if __name__ == "__main__":
     # 同时存一份 json 到本地(MLflow 挂掉时兜底)
     metrics_path = os.path.join(args.out_dir, "metrics.json")
     with open(metrics_path, "w", encoding='utf-8') as f:
-        json.dump({"adapter": args.adapter, "metrics": metrics}, f, indent=2)
+        json.dump({
+            "base": args.base,
+            "adapter": args.adapter,
+            "mode": "adapter" if args.adapter else "base_only",
+            "metrics": metrics,
+        }, f, indent=2)
     print(f"指标 json 保存到 {metrics_path}")
 
-    try:
-        if args.mlflow_run_id:
-            # 写回训练 run
-            with mlflow.start_run(run_id=args.mlflow_run_id):
-                mlflow.log_metrics(metrics)
-                if gen_path:
-                    mlflow.log_artifact(gen_path, artifact_path="eval")
-                mlflow.log_artifact(metrics_path, artifact_path="eval")
-            print(f"✓ 指标写回训练 run: {args.mlflow_run_id}")
-        else:
-            # 新建 eval-only run
-            mlflow.set_experiment(args.mlflow_experiment)
-            run_name = f"eval-{os.path.basename(args.adapter).replace('.pt','')}"
-            with mlflow.start_run(run_name=run_name):
-                mlflow.set_tag("type", "eval_only")
-                mlflow.set_tag("adapter", args.adapter)
-                mlflow.set_tag("base", args.base)
-                mlflow.log_metrics(metrics)
-                if gen_path:
-                    mlflow.log_artifact(gen_path, artifact_path="eval")
-                mlflow.log_artifact(metrics_path, artifact_path="eval")
-            print(f"✓ 新建 eval-only run 写入 experiment: {args.mlflow_experiment}")
-    except Exception as e:
-        print(f"⚠️ MLflow 写入失败(但本地 json 已保存): {e}")
+    if args.no_mlflow:
+        print("已跳过 MLflow 写入(--no_mlflow)")
+    else:
+        try:
+            import mlflow
+
+            if args.mlflow_run_id:
+                # 写回训练 run
+                with mlflow.start_run(run_id=args.mlflow_run_id):
+                    mlflow.set_tag("mode", "adapter" if args.adapter else "base_only")
+                    mlflow.set_tag("base", args.base)
+                    if args.adapter:
+                        mlflow.set_tag("adapter", args.adapter)
+                    mlflow.log_metrics(metrics)
+                    if gen_path:
+                        mlflow.log_artifact(gen_path, artifact_path="eval")
+                    mlflow.log_artifact(metrics_path, artifact_path="eval")
+                print(f"✓ 指标写回训练 run: {args.mlflow_run_id}")
+            else:
+                # 新建 eval-only run
+                mlflow.set_experiment(args.mlflow_experiment)
+                run_name = f"eval-{run_suffix}"
+                with mlflow.start_run(run_name=run_name):
+                    mlflow.set_tag("type", "eval_only")
+                    mlflow.set_tag("mode", "adapter" if args.adapter else "base_only")
+                    if args.adapter:
+                        mlflow.set_tag("adapter", args.adapter)
+                    mlflow.set_tag("base", args.base)
+                    mlflow.log_metrics(metrics)
+                    if gen_path:
+                        mlflow.log_artifact(gen_path, artifact_path="eval")
+                    mlflow.log_artifact(metrics_path, artifact_path="eval")
+                print(f"✓ 新建 eval-only run 写入 experiment: {args.mlflow_experiment}")
+        except Exception as e:
+            print(f"⚠️ MLflow 写入失败(但本地 json 已保存): {e}")
 
     print("\n===== 评估完成 =====")
     print(f"PPL:       {ppl:.3f}")
