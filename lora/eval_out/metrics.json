@@ -1,0 +1,13 @@
+{
+  "base": "model/Qwen3-8B",
+  "adapter": null,
+  "mode": "base_only",
+  "metrics": {
+    "eval/ppl": 2203304.0901341024,
+    "eval/avg_loss": 14.60546865081787,
+    "eval/n_tokens": 511000.0,
+    "eval/format_4lines_rate": 0.8235294117647058,
+    "eval/format_5char_lines": 12.0,
+    "eval/format_7char_lines": 14.0
+  }
+}

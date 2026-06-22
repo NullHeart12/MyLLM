@@ -1128,101 +1128,101 @@ if __name__ == "__main__":
 
 
     # ===== 数据流水线配置(集中放,方便 MLflow log_params)=====
-    # CONVERT_CFG = {
-    #     "input_dir":            read_chinese_poetry_dir,
-    #     "output_path":          output_chinese_poetry_jsonl,
-    #     "include_tang":         True,
-    #     "include_song":         True,
-    #     "include_authors":      True,     # NEW: 把 author bio 一起作为训练样本
-    #     "simplify_traditional": True,    # 作者警告:转简体会丢语义,保持繁体
-    #     "min_length":           10,
-    #     "max_bio_length":       1100,      # 作者生平超过此长度截断,防止训练分布被长 bio 主导
-    #     "text_format":          "朝代 · 作者《题目》:正文 + 作者简介",
-    # }
-    # TOKENIZER_PATH = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
-    # PROCESS_CFG = {
-    #     "input_path":            output_chinese_poetry_jsonl,
-    #     "output_path":           output_chinese_poetry_arrow,
-    #     "tokenizer_dir_or_name": TOKENIZER_PATH,
-    #     "tokenizer_name":        os.path.basename(TOKENIZER_PATH),  # log 短名字,Qwen3-32B
-    #     "chunk_size":            512,
-    # }
+    CONVERT_CFG = {
+        "input_dir":            read_chinese_poetry_dir,
+        "output_path":          output_chinese_poetry_jsonl,
+        "include_tang":         True,
+        "include_song":         True,
+        "include_authors":      True,     # NEW: 把 author bio 一起作为训练样本
+        "simplify_traditional": True,    # 作者警告:转简体会丢语义,保持繁体
+        "min_length":           10,
+        "max_bio_length":       1100,      # 作者生平超过此长度截断,防止训练分布被长 bio 主导
+        "text_format":          "朝代 · 作者《题目》:正文 + 作者简介",
+    }
+    TOKENIZER_PATH = os.path.join(PROJECT_ROOT, 'model', 'Qwen3-8B')
+    PROCESS_CFG = {
+        "input_path":            output_chinese_poetry_jsonl,
+        "output_path":           output_chinese_poetry_arrow,
+        "tokenizer_dir_or_name": TOKENIZER_PATH,
+        "tokenizer_name":        os.path.basename(TOKENIZER_PATH),  # log 短名字,Qwen3-32B
+        "chunk_size":            512,
+    }
 
-    # MLFLOW_EXPERIMENT = "MyLLM-DataPipeline"
-    # mlflow.set_experiment(MLFLOW_EXPERIMENT)
+    MLFLOW_EXPERIMENT = "MyLLM-DataPipeline"
+    mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    # # 收集本次跑的 run id,跑完写 sidecar 文件供训练脚本读
-    # data_lineage = {"experiment": MLFLOW_EXPERIMENT}
+    # 收集本次跑的 run id,跑完写 sidecar 文件供训练脚本读
+    data_lineage = {"experiment": MLFLOW_EXPERIMENT}
 
-    # # ---- 阶段 1:数据预处理(唐诗 + 宋词 JSON → jsonl) ----
-    # with mlflow.start_run(run_name="convert_chinese_poetry"):
-    #     mlflow.set_tag("stage", "preprocess")
-    #     mlflow.set_tag("dataset", "chinese-poetry")
-    #     mlflow.log_params(CONVERT_CFG)
+    # ---- 阶段 1:数据预处理(唐诗 + 宋词 JSON → jsonl) ----
+    with mlflow.start_run(run_name="convert_chinese_poetry"):
+        mlflow.set_tag("stage", "preprocess")
+        mlflow.set_tag("dataset", "chinese-poetry")
+        mlflow.log_params(CONVERT_CFG)
 
-    #     stats = ChinesePoetryConverter(
-    #         input_dir=CONVERT_CFG["input_dir"],
-    #         output_path=CONVERT_CFG["output_path"],
-    #         include_tang=CONVERT_CFG["include_tang"],
-    #         include_song=CONVERT_CFG["include_song"],
-    #         include_authors=CONVERT_CFG["include_authors"],
-    #         simplify_traditional=CONVERT_CFG["simplify_traditional"],
-    #         min_length=CONVERT_CFG["min_length"],
-    #         max_bio_length=CONVERT_CFG["max_bio_length"],
-    #     ).run()
+        stats = ChinesePoetryConverter(
+            input_dir=CONVERT_CFG["input_dir"],
+            output_path=CONVERT_CFG["output_path"],
+            include_tang=CONVERT_CFG["include_tang"],
+            include_song=CONVERT_CFG["include_song"],
+            include_authors=CONVERT_CFG["include_authors"],
+            simplify_traditional=CONVERT_CFG["simplify_traditional"],
+            min_length=CONVERT_CFG["min_length"],
+            max_bio_length=CONVERT_CFG["max_bio_length"],
+        ).run()
 
-    #     if stats is not None:
-    #         mlflow.log_metrics(stats)
-    #     else:
-    #         mlflow.set_tag("skipped", "output_already_exists")
+        if stats is not None:
+            mlflow.log_metrics(stats)
+        else:
+            mlflow.set_tag("skipped", "output_already_exists")
 
-    #     # 记 run_id,供下游(训练)交叉追溯
-    #     data_lineage["convert_run_id"] = mlflow.active_run().info.run_id
+        # 记 run_id,供下游(训练)交叉追溯
+        data_lineage["convert_run_id"] = mlflow.active_run().info.run_id
 
-    # # ---- 阶段 2:特征工程(tokenize + packing 成 arrow) ----
-    # with mlflow.start_run(run_name=f"feature_eng_chunk{PROCESS_CFG['chunk_size']}"):
-    #     mlflow.set_tag("stage", "feature_eng")
-    #     mlflow.set_tag("tokenizer", PROCESS_CFG["tokenizer_name"])
-    #     # tokenizer 路径太长,只 log 短名字;其他 cfg 全 log
-    #     mlflow.log_params({k: v for k, v in PROCESS_CFG.items() if k != "tokenizer_dir_or_name"})
-    #     # 也把上游(convert)的 run id 当 tag 记一下,数据流水线内部也可追溯
-    #     # convert 跳过时 key 不存在,用 .get() 安全访问
-    #     upstream_convert_id = data_lineage.get("convert_run_id")
-    #     if upstream_convert_id:
-    #         mlflow.set_tag("upstream_convert_run_id", upstream_convert_id)
+    # ---- 阶段 2:特征工程(tokenize + packing 成 arrow) ----
+    with mlflow.start_run(run_name=f"feature_eng_chunk{PROCESS_CFG['chunk_size']}"):
+        mlflow.set_tag("stage", "feature_eng")
+        mlflow.set_tag("tokenizer", PROCESS_CFG["tokenizer_name"])
+        # tokenizer 路径太长,只 log 短名字;其他 cfg 全 log
+        mlflow.log_params({k: v for k, v in PROCESS_CFG.items() if k != "tokenizer_dir_or_name"})
+        # 也把上游(convert)的 run id 当 tag 记一下,数据流水线内部也可追溯
+        # convert 跳过时 key 不存在,用 .get() 安全访问
+        upstream_convert_id = data_lineage.get("convert_run_id")
+        if upstream_convert_id:
+            mlflow.set_tag("upstream_convert_run_id", upstream_convert_id)
             
-    #     stats = PretrainProcessor(
-    #         input_path=PROCESS_CFG["input_path"],
-    #         output_path=PROCESS_CFG["output_path"],
-    #         tokenizer_dir_or_name=PROCESS_CFG["tokenizer_dir_or_name"],
-    #         chunk_size=PROCESS_CFG["chunk_size"],
-    #     ).run()
+        stats = PretrainProcessor(
+            input_path=PROCESS_CFG["input_path"],
+            output_path=PROCESS_CFG["output_path"],
+            tokenizer_dir_or_name=PROCESS_CFG["tokenizer_dir_or_name"],
+            chunk_size=PROCESS_CFG["chunk_size"],
+        ).run()
 
-    #     if stats is not None:
-    #         mlflow.log_metrics(stats)
-    #     else:
-    #         mlflow.set_tag("skipped", "output_already_exists")
+        if stats is not None:
+            mlflow.log_metrics(stats)
+        else:
+            mlflow.set_tag("skipped", "output_already_exists")
 
-    #     data_lineage["feature_eng_run_id"] = mlflow.active_run().info.run_id
+        data_lineage["feature_eng_run_id"] = mlflow.active_run().info.run_id
 
-    # # ---- 写 sidecar 文件,供训练脚本读取并设为 tag(交叉追溯) ----
-    # # 放在 arrow 目录旁边(同名 + .mlflow.json),不进 arrow 内部以免污染 dataset 结构。
-    # # 重跑保护:只在"feature_eng 这次真跑了"或"sidecar 从未写过"时覆盖,
-    # # 避免重跑空脚本(arrow 已存在 → 两阶段都跳过)用空 run 把上次有效的 run_id 冲掉。
-    # lineage_path = output_chinese_poetry_arrow.rstrip('/') + ".mlflow.json"
-    # should_write_lineage = (
-    #     stats is not None                       # feature_eng 这次确实跑了(没跳过)
-    #     or not os.path.exists(lineage_path)     # 或者之前从未写过 sidecar
-    # )
-    # if should_write_lineage:
-    #     os.makedirs(os.path.dirname(lineage_path) or '.', exist_ok=True)
-    #     with open(lineage_path, "w", encoding='utf-8') as f:
-    #         json.dump(data_lineage, f, indent=2, ensure_ascii=False)
-    #     print(f"Lineage 写入: {lineage_path}")
-    #     print(f"  convert_run_id:     {data_lineage['convert_run_id']}")
-    #     print(f"  feature_eng_run_id: {data_lineage['feature_eng_run_id']}")
-    # else:
-    #     print(f"两阶段都跳过,保留已有 Lineage: {lineage_path}")
+    # ---- 写 sidecar 文件,供训练脚本读取并设为 tag(交叉追溯) ----
+    # 放在 arrow 目录旁边(同名 + .mlflow.json),不进 arrow 内部以免污染 dataset 结构。
+    # 重跑保护:只在"feature_eng 这次真跑了"或"sidecar 从未写过"时覆盖,
+    # 避免重跑空脚本(arrow 已存在 → 两阶段都跳过)用空 run 把上次有效的 run_id 冲掉。
+    lineage_path = output_chinese_poetry_arrow.rstrip('/') + ".mlflow.json"
+    should_write_lineage = (
+        stats is not None                       # feature_eng 这次确实跑了(没跳过)
+        or not os.path.exists(lineage_path)     # 或者之前从未写过 sidecar
+    )
+    if should_write_lineage:
+        os.makedirs(os.path.dirname(lineage_path) or '.', exist_ok=True)
+        with open(lineage_path, "w", encoding='utf-8') as f:
+            json.dump(data_lineage, f, indent=2, ensure_ascii=False)
+        print(f"Lineage 写入: {lineage_path}")
+        print(f"  convert_run_id:     {data_lineage['convert_run_id']}")
+        print(f"  feature_eng_run_id: {data_lineage['feature_eng_run_id']}")
+    else:
+        print(f"两阶段都跳过,保留已有 Lineage: {lineage_path}")
 
 
     # # ====================================================================
@@ -1295,11 +1295,11 @@ if __name__ == "__main__":
     #     system_prompt=None,
     # ).run()
 
-    tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3.5-4B')
-    DPOProcessor(
-        input_path=read_dpo_data,
-        output_path=output_dpo_data,
-        tokenizer_dir_or_name=tokenizer_path_or_name,
-        max_len=8092,
-        system_prompt=None,
-    ).run()
+    # tokenizer_path_or_name = os.path.join(PROJECT_ROOT, 'model', 'Qwen3.5-4B')
+    # DPOProcessor(
+    #     input_path=read_dpo_data,
+    #     output_path=output_dpo_data,
+    #     tokenizer_dir_or_name=tokenizer_path_or_name,
+    #     max_len=8092,
+    #     system_prompt=None,
+    # ).run()
